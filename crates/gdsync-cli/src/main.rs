@@ -94,6 +94,19 @@ enum Commands {
         /// Google Drive folder ID of second folder
         folder2: String,
     },
+
+    /// Server-side merge unique files from source Google Drive folder into destination folder
+    Merge {
+        /// Source Google Drive folder ID (files will be copied from here)
+        source: String,
+
+        /// Destination Google Drive folder ID (files will be copied into here)
+        destination: String,
+
+        /// Automatically proceed without confirmation prompt
+        #[arg(short = 'y', long = "yes")]
+        yes: bool,
+    },
 }
 
 #[tokio::main]
@@ -123,6 +136,11 @@ async fn main() -> Result<()> {
         Commands::Watch { path, debounce_ms } => handle_watch(path, debounce_ms).await?,
         Commands::Status { path } => handle_status(path)?,
         Commands::Diff { folder1, folder2 } => handle_diff(folder1, folder2).await?,
+        Commands::Merge {
+            source,
+            destination,
+            yes,
+        } => handle_merge(source, destination, yes).await?,
     }
 
     Ok(())
@@ -505,6 +523,115 @@ async fn handle_diff(folder1: String, folder2: String) -> Result<()> {
     } else {
         println!("Conclusion: Both folders have unique files or modifications that differ.");
     }
+
+    Ok(())
+}
+
+async fn handle_merge(source: String, destination: String, yes: bool) -> Result<()> {
+    println!("Connecting to Google Drive...");
+    let drive = DriveClient::from_auth().await?;
+
+    let meta_src = drive
+        .get_file_metadata(&source)
+        .await
+        .with_context(|| format!("Failed to access source folder (ID: {})", source))?;
+    let meta_dest = drive
+        .get_file_metadata(&destination)
+        .await
+        .with_context(|| format!("Failed to access destination folder (ID: {})", destination))?;
+
+    println!("Analyzing folders on Google Drive...");
+    println!("  Source:      '{}' (ID: {})", meta_src.name, source);
+    println!("  Destination: '{}' (ID: {})", meta_dest.name, destination);
+
+    let src_files = drive.list_files_recursive(&source).await?;
+    let dest_files = drive.list_files_recursive(&destination).await?;
+
+    let dest_map: HashMap<PathBuf, &DriveFile> =
+        dest_files.iter().map(|(p, f)| (p.clone(), f)).collect();
+
+    let mut files_to_merge = Vec::new();
+    for (path, src_file) in &src_files {
+        if !dest_map.contains_key(path) {
+            files_to_merge.push((path, src_file));
+        }
+    }
+
+    if files_to_merge.is_empty() {
+        println!(
+            "\nNothing to merge! All {} files from '{}' already exist in '{}'.",
+            src_files.len(),
+            meta_src.name,
+            meta_dest.name
+        );
+        return Ok(());
+    }
+
+    println!(
+        "\nFound {} unique files to merge from '{}' into '{}'.",
+        files_to_merge.len(),
+        meta_src.name,
+        meta_dest.name
+    );
+
+    if !yes {
+        print!(
+            "Proceed with server-side copy into '{}'? [y/N]: ",
+            meta_dest.name
+        );
+        use std::io::Write;
+        std::io::stdout().flush()?;
+        let mut confirm = String::new();
+        std::io::stdin().read_line(&mut confirm)?;
+        if !confirm.trim().eq_ignore_ascii_case("y") {
+            println!("Merge cancelled.");
+            return Ok(());
+        }
+    }
+
+    println!("\nStarting server-side copy on Google Drive (instant, 0 upload bandwidth)...");
+    let total = files_to_merge.len();
+    let mut success_count = 0;
+
+    for (idx, (rel_path, src_file)) in files_to_merge.iter().enumerate() {
+        let parent_dir = rel_path.parent().unwrap_or_else(|| Path::new(""));
+        let target_parent_id = drive
+            .ensure_remote_dir_path(&destination, parent_dir)
+            .await?;
+
+        match drive
+            .copy_file(&src_file.id, &target_parent_id, &src_file.name)
+            .await
+        {
+            Ok(_) => {
+                success_count += 1;
+                println!("[{}/{}] Copied: {}", idx + 1, total, rel_path.display());
+            }
+            Err(err) => {
+                eprintln!(
+                    "[{}/{}] FAILED {}: {}",
+                    idx + 1,
+                    total,
+                    rel_path.display(),
+                    err
+                );
+            }
+        }
+    }
+
+    println!("\n============================================================");
+    println!("                     MERGE COMPLETED                        ");
+    println!("============================================================");
+    println!(
+        "  Successfully copied {} of {} files into '{}' (ID: {})",
+        success_count, total, meta_dest.name, destination
+    );
+    println!("  Destination now has all files consolidated!");
+    println!(
+        "  You can now safely delete the redundant folder '{}' in Google Drive.",
+        meta_src.name
+    );
+    println!("============================================================");
 
     Ok(())
 }

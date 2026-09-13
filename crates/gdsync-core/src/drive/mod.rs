@@ -7,7 +7,7 @@ use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
-use tracing::debug;
+use tracing::{debug, warn};
 
 const DRIVE_FILES_API: &str = "https://www.googleapis.com/drive/v3/files";
 const DRIVE_UPLOAD_API: &str = "https://www.googleapis.com/upload/drive/v3/files";
@@ -80,29 +80,50 @@ impl DriveClient {
         Ok(format!("Bearer {}", token))
     }
 
-    /// Fetches file or folder metadata by ID.
+    /// Fetches file or folder metadata by ID with automatic retry for rate limits.
     pub async fn get_file_metadata(&self, file_id: &str) -> Result<DriveFile> {
-        let auth = self.auth_header().await?;
         let url = format!(
             "{}/{}?fields=id,name,mimeType,md5Checksum,modifiedTime,size,trashed,parents",
             DRIVE_FILES_API, file_id
         );
 
-        let resp = self
-            .client
-            .get(&url)
-            .header(header::AUTHORIZATION, &auth)
-            .send()
-            .await
-            .context("Failed to request Drive file metadata")?;
+        let mut attempts = 0;
+        let max_attempts = 5;
 
-        if !resp.status().is_success() {
+        loop {
+            attempts += 1;
+            let auth = self.auth_header().await?;
+
+            let resp = self
+                .client
+                .get(&url)
+                .header(header::AUTHORIZATION, &auth)
+                .send()
+                .await
+                .context("Failed to request Drive file metadata")?;
+
+            let status = resp.status();
+            if status.is_success() {
+                let file: DriveFile = resp.json().await.context("Failed to parse DriveFile JSON")?;
+                return Ok(file);
+            }
+
             let err = resp.text().await.unwrap_or_default();
+            if (status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::FORBIDDEN)
+                && (err.contains("rateLimitExceeded") || err.contains("userRateLimitExceeded") || err.contains("quota"))
+                && attempts < max_attempts
+            {
+                let delay = std::time::Duration::from_millis(1000 * (1 << (attempts - 1)));
+                warn!(
+                    "Rate limit encountered on get_file_metadata for {}. Retrying in {:?} (attempt {}/{})",
+                    file_id, delay, attempts, max_attempts
+                );
+                tokio::time::sleep(delay).await;
+                continue;
+            }
+
             bail!("Drive get_file_metadata failed for {}: {}", file_id, err);
         }
-
-        let file: DriveFile = resp.json().await.context("Failed to parse DriveFile JSON")?;
-        Ok(file)
     }
 
     /// Finds a child file/folder by name inside a parent folder.
@@ -148,37 +169,58 @@ impl DriveClient {
     pub async fn list_children(&self, parent_id: &str) -> Result<Vec<DriveFile>> {
         let mut all_files = Vec::new();
         let mut page_token: Option<String> = None;
+        let q = format!("'{}' in parents and trashed = false", parent_id);
 
         loop {
-            let auth = self.auth_header().await?;
-            let q = format!("'{}' in parents and trashed = false", parent_id);
+            let mut attempts = 0;
+            let max_attempts = 5;
 
-            let mut req = self
-                .client
-                .get(DRIVE_FILES_API)
-                .header(header::AUTHORIZATION, &auth)
-                .query(&[
-                    ("q", q.as_str()),
-                    (
-                        "fields",
-                        "nextPageToken,files(id,name,mimeType,md5Checksum,modifiedTime,size,trashed,parents)",
-                    ),
-                    ("pageSize", "1000"),
-                ]);
+            let list: FileListResponse = loop {
+                attempts += 1;
+                let auth = self.auth_header().await?;
+                let mut req = self
+                    .client
+                    .get(DRIVE_FILES_API)
+                    .header(header::AUTHORIZATION, &auth)
+                    .query(&[
+                        ("q", q.as_str()),
+                        (
+                            "fields",
+                            "nextPageToken,files(id,name,mimeType,md5Checksum,modifiedTime,size,trashed,parents)",
+                        ),
+                        ("pageSize", "1000"),
+                    ]);
 
-            if let Some(token) = &page_token {
-                req = req.query(&[("pageToken", token.as_str())]);
-            }
+                if let Some(token) = &page_token {
+                    req = req.query(&[("pageToken", token.as_str())]);
+                }
 
-            let resp = req.send().await.context("Failed to list files in folder")?;
-            if !resp.status().is_success() {
+                let resp = req.send().await.context("Failed to list files in folder")?;
+                let status = resp.status();
+
+                if status.is_success() {
+                    let parsed: FileListResponse = resp.json().await.context("Failed to parse file list")?;
+                    break parsed;
+                }
+
                 let err = resp.text().await.unwrap_or_default();
+                if (status == StatusCode::TOO_MANY_REQUESTS || status == StatusCode::FORBIDDEN)
+                    && (err.contains("rateLimitExceeded") || err.contains("userRateLimitExceeded") || err.contains("quota"))
+                    && attempts < max_attempts
+                {
+                    let delay = std::time::Duration::from_millis(1000 * (1 << (attempts - 1)));
+                    warn!(
+                        "Rate limit encountered on list_children. Retrying in {:?} (attempt {}/{})",
+                        delay, attempts, max_attempts
+                    );
+                    tokio::time::sleep(delay).await;
+                    continue;
+                }
+
                 bail!("Drive list_children failed: {}", err);
-            }
+            };
 
-            let list: FileListResponse = resp.json().await.context("Failed to parse file list")?;
             all_files.extend(list.files);
-
             page_token = list.next_page_token;
             if page_token.is_none() {
                 break;
@@ -207,6 +249,44 @@ impl DriveClient {
         }
 
         Ok(results)
+    }
+
+    /// Copies an existing file in Google Drive to a new parent folder with a name.
+    pub async fn copy_file(
+        &self,
+        file_id: &str,
+        target_parent_id: &str,
+        name: &str,
+    ) -> Result<DriveFile> {
+        let auth = self.auth_header().await?;
+        let url = format!("{}/{}/copy", DRIVE_FILES_API, file_id);
+
+        let body = serde_json::json!({
+            "name": name,
+            "parents": [target_parent_id]
+        });
+
+        let resp = self
+            .client
+            .post(&url)
+            .header(header::AUTHORIZATION, &auth)
+            .header(header::CONTENT_TYPE, "application/json")
+            .query(&[(
+                "fields",
+                "id,name,mimeType,md5Checksum,modifiedTime,size,trashed,parents",
+            )])
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to send copy file request")?;
+
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            bail!("Drive copy_file failed for {}: {}", file_id, err);
+        }
+
+        let copied: DriveFile = resp.json().await.context("Failed to parse copied DriveFile")?;
+        Ok(copied)
     }
 
     /// Creates a new directory in Google Drive under the specified parent.
