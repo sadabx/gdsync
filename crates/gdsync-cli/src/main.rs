@@ -8,7 +8,7 @@ use gdsync_core::config::{
 use gdsync_core::db::Database;
 use gdsync_core::drive::{DriveClient, DriveFile};
 use gdsync_core::filter::GitignoreFilter;
-use gdsync_core::sync::SyncCoordinator;
+use gdsync_core::sync::{SyncCoordinator, SyncOptions};
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::Level;
@@ -74,6 +74,18 @@ enum Commands {
         /// Target directory to sync (defaults to current directory)
         #[arg(default_value = ".")]
         path: PathBuf,
+
+        /// Preview files that will be uploaded/downloaded/trashed without modifying disk or Google Drive
+        #[arg(long)]
+        dry_run: bool,
+
+        /// Number of concurrent transfer threads (default: 4)
+        #[arg(long, default_value = "4")]
+        concurrency: usize,
+
+        /// Permanently delete remote files instead of moving to Google Drive Trash
+        #[arg(long)]
+        permanent_delete: bool,
     },
 
     /// Start the long-running inotify background daemon
@@ -85,6 +97,18 @@ enum Commands {
         /// Debounce buffer time in milliseconds (default: 500ms)
         #[arg(long)]
         debounce_ms: Option<u64>,
+
+        /// Number of concurrent transfer threads (default: 4)
+        #[arg(long, default_value = "4")]
+        concurrency: usize,
+
+        /// Permanently delete remote files instead of moving to Google Drive Trash
+        #[arg(long)]
+        permanent_delete: bool,
+
+        /// Send desktop notifications on sync events (requires notify-send)
+        #[arg(long)]
+        notify: bool,
     },
 
     /// Inspect sync state, tracked files, and database statistics
@@ -115,6 +139,35 @@ enum Commands {
         #[arg(short = 'y', long = "yes")]
         yes: bool,
     },
+
+    /// Generate shell auto-completions (bash, zsh, fish, powershell, elvish)
+    Completions {
+        /// Target shell to generate completions for
+        #[arg(value_enum)]
+        shell: clap_complete::Shell,
+    },
+
+    /// Manage gdsync background systemd user daemon
+    Service {
+        #[command(subcommand)]
+        command: ServiceCommands,
+    },
+}
+
+#[derive(Subcommand)]
+enum ServiceCommands {
+    /// Install, enable, and start gdsync as a systemd user service
+    Install,
+    /// Check status of gdsync systemd user service
+    Status,
+    /// Start gdsync systemd user service
+    Start,
+    /// Stop gdsync systemd user service
+    Stop,
+    /// Restart gdsync systemd user service
+    Restart,
+    /// View live logs from gdsync systemd service
+    Logs,
 }
 
 #[tokio::main]
@@ -140,8 +193,19 @@ async fn main() -> Result<()> {
         } => handle_auth(client_id, client_secret).await?,
         Commands::Init { path, drive_folder } => handle_init(path, drive_folder).await?,
         Commands::Scan { path } => handle_scan(path)?,
-        Commands::Sync { path } => handle_sync(path).await?,
-        Commands::Watch { path, debounce_ms } => handle_watch(path, debounce_ms).await?,
+        Commands::Sync {
+            path,
+            dry_run,
+            concurrency,
+            permanent_delete,
+        } => handle_sync(path, dry_run, concurrency, permanent_delete).await?,
+        Commands::Watch {
+            path,
+            debounce_ms,
+            concurrency,
+            permanent_delete,
+            notify,
+        } => handle_watch(path, debounce_ms, concurrency, permanent_delete, notify).await?,
         Commands::Status { path } => handle_status(path)?,
         Commands::Diff { folder1, folder2 } => handle_diff(folder1, folder2).await?,
         Commands::Merge {
@@ -149,6 +213,8 @@ async fn main() -> Result<()> {
             destination,
             yes,
         } => handle_merge(source, destination, yes).await?,
+        Commands::Completions { shell } => handle_completions(shell)?,
+        Commands::Service { command } => handle_service(command)?,
     }
 
     Ok(())
@@ -300,11 +366,22 @@ fn handle_scan(path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn handle_sync(path: PathBuf) -> Result<()> {
+async fn handle_sync(
+    path: PathBuf,
+    dry_run: bool,
+    concurrency: usize,
+    permanent_delete: bool,
+) -> Result<()> {
     let dir_cfg = resolve_directory_config(&path)?;
 
     println!("Starting reconciliation pass for {:?}", dir_cfg.local_path);
     println!("Remote Drive Root ID: {}", dir_cfg.drive_folder_id);
+    if dry_run {
+        println!("Mode:         DRY RUN (previewing actions only, no changes will be made)\n");
+    } else {
+        println!("Concurrency:  {} worker threads", concurrency);
+        println!("Deletion:     {}\n", if permanent_delete { "Permanent Purge" } else { "Safe Cloud Trash (30-day recovery)" });
+    }
 
     let drive = DriveClient::from_auth().await?;
     let db = Database::open_default()?;
@@ -315,9 +392,20 @@ async fn handle_sync(path: PathBuf) -> Result<()> {
         db,
     )?;
 
-    let summary = coordinator.reconcile().await?;
+    let options = SyncOptions {
+        dry_run,
+        permanent_delete,
+        concurrency,
+        show_progress: !dry_run,
+    };
 
-    println!("\nReconciliation Completed!");
+    let summary = coordinator.reconcile_with_options(&options).await?;
+
+    if dry_run {
+        println!("\nDry-Run Reconciliation Plan Summary:");
+    } else {
+        println!("\nReconciliation Completed!");
+    }
     println!("  Uploaded:   {} files", summary.files_uploaded);
     println!("  Downloaded: {} files", summary.files_downloaded);
     println!("  Deleted:    {} files", summary.files_deleted);
@@ -329,15 +417,27 @@ async fn handle_sync(path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn handle_watch(path: PathBuf, debounce_override: Option<u64>) -> Result<()> {
+async fn handle_watch(
+    path: PathBuf,
+    debounce_override: Option<u64>,
+    concurrency: usize,
+    permanent_delete: bool,
+    notify: bool,
+) -> Result<()> {
     let dir_cfg = resolve_directory_config(&path)?;
     let debounce_ms = debounce_override.unwrap_or(dir_cfg.debounce_ms);
 
     println!("{}", BANNER);
     println!("Starting gdsync daemon in watch mode...");
-    println!("  Directory:    {:?}", dir_cfg.local_path);
-    println!("  Drive Folder: {}", dir_cfg.drive_folder_id);
-    println!("  Debounce:     {} ms", debounce_ms);
+    println!("  Directory:     {:?}", dir_cfg.local_path);
+    println!("  Drive Folder:  {}", dir_cfg.drive_folder_id);
+    println!("  Debounce:      {} ms", debounce_ms);
+    println!("  Concurrency:   {} threads", concurrency);
+    println!("  Notifications: {}", if notify { "Enabled" } else { "Disabled" });
+
+    if notify {
+        notify_user("gdsync", &format!("Monitoring {:?} in background", dir_cfg.local_path.file_name().unwrap_or_default().to_string_lossy()));
+    }
 
     let drive = DriveClient::from_auth().await?;
     let db = Database::open_default()?;
@@ -348,8 +448,121 @@ async fn handle_watch(path: PathBuf, debounce_override: Option<u64>) -> Result<(
         db,
     )?;
 
+    // Run initial reconciliation with options
+    let options = SyncOptions {
+        dry_run: false,
+        permanent_delete,
+        concurrency,
+        show_progress: true,
+    };
+    let summary = coordinator.reconcile_with_options(&options).await?;
+    if notify && (summary.files_uploaded > 0 || summary.files_downloaded > 0) {
+        notify_user("gdsync: Initial Sync Complete", &format!("Synced {} files", summary.files_uploaded + summary.files_downloaded));
+    }
+
     coordinator.start_daemon(debounce_ms).await?;
     Ok(())
+}
+
+fn handle_completions(shell: clap_complete::Shell) -> Result<()> {
+    use clap::CommandFactory;
+    let mut cmd = Cli::command();
+    clap_complete::generate(shell, &mut cmd, "gdsync", &mut std::io::stdout());
+    Ok(())
+}
+
+fn handle_service(cmd: ServiceCommands) -> Result<()> {
+    match cmd {
+        ServiceCommands::Install => {
+            let exe_path = std::env::current_exe()
+                .context("Failed to determine current executable path")?;
+            let service_dir = dirs::config_dir()
+                .context("Could not find user config dir")?
+                .join("systemd/user");
+            std::fs::create_dir_all(&service_dir)?;
+
+            let service_file = service_dir.join("gdsync.service");
+            let service_content = format!(
+                r#"[Unit]
+Description=gdsync background Google Drive sync daemon
+After=network-online.target
+
+[Service]
+Type=simple
+ExecStart={} watch
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=default.target
+"#,
+                exe_path.display()
+            );
+
+            std::fs::write(&service_file, service_content)?;
+            println!("Wrote systemd unit file to {:?}", service_file);
+
+            println!("Reloading systemd user daemon...");
+            let _ = std::process::Command::new("systemctl")
+                .args(["--user", "daemon-reload"])
+                .status();
+
+            println!("Enabling and starting gdsync.service...");
+            let status = std::process::Command::new("systemctl")
+                .args(["--user", "enable", "--now", "gdsync.service"])
+                .status();
+
+            if let Ok(s) = status {
+                if s.success() {
+                    println!("\ngdsync.service has been successfully installed and started!");
+                    println!("Check status with: gdsync service status");
+                    println!("View live logs with: gdsync service logs");
+                } else {
+                    println!("\nWarning: systemctl command exited with code {:?}", s.code());
+                }
+            }
+        }
+        ServiceCommands::Status => {
+            let _ = std::process::Command::new("systemctl")
+                .args(["--user", "status", "gdsync.service"])
+                .status();
+        }
+        ServiceCommands::Start => {
+            let _ = std::process::Command::new("systemctl")
+                .args(["--user", "start", "gdsync.service"])
+                .status();
+            println!("Started gdsync.service");
+        }
+        ServiceCommands::Stop => {
+            let _ = std::process::Command::new("systemctl")
+                .args(["--user", "stop", "gdsync.service"])
+                .status();
+            println!("Stopped gdsync.service");
+        }
+        ServiceCommands::Restart => {
+            let _ = std::process::Command::new("systemctl")
+                .args(["--user", "restart", "gdsync.service"])
+                .status();
+            println!("Restarted gdsync.service");
+        }
+        ServiceCommands::Logs => {
+            let _ = std::process::Command::new("journalctl")
+                .args(["--user", "-u", "gdsync.service", "-n", "50", "-f"])
+                .status();
+        }
+    }
+    Ok(())
+}
+
+fn notify_user(title: &str, message: &str) {
+    let _ = std::process::Command::new("notify-send")
+        .arg("-a")
+        .arg("gdsync")
+        .arg("-i")
+        .arg("emblem-synchronized")
+        .arg(title)
+        .arg(message)
+        .spawn();
 }
 
 fn handle_status(path: PathBuf) -> Result<()> {

@@ -540,7 +540,35 @@ impl DriveClient {
         Ok(())
     }
 
-    /// Permanently deletes or trashes a file/folder in Google Drive.
+    /// Safely moves a file or folder to Google Drive Trash (recoverable for 30 days).
+    pub async fn trash_file(&self, file_id: &str) -> Result<()> {
+        let auth = self.auth_header().await?;
+        let url = format!("{}/{}", DRIVE_FILES_API, file_id);
+
+        let body = serde_json::json!({
+            "trashed": true
+        });
+
+        let resp = self
+            .client
+            .patch(&url)
+            .header(header::AUTHORIZATION, &auth)
+            .header(header::CONTENT_TYPE, "application/json")
+            .json(&body)
+            .send()
+            .await
+            .context("Failed to send trash file request")?;
+
+        if !resp.status().is_success() && resp.status() != StatusCode::NOT_FOUND {
+            let err = resp.text().await.unwrap_or_default();
+            bail!("Drive trash_file failed for {}: {}", file_id, err);
+        }
+
+        debug!("Moved Drive file/folder to trash: {}", file_id);
+        Ok(())
+    }
+
+    /// Permanently deletes a file/folder in Google Drive.
     pub async fn delete_file(&self, file_id: &str) -> Result<()> {
         let auth = self.auth_header().await?;
         let url = format!("{}/{}", DRIVE_FILES_API, file_id);
@@ -558,7 +586,7 @@ impl DriveClient {
             bail!("Drive delete_file failed for {}: {}", file_id, err);
         }
 
-        debug!("Deleted Drive file/folder: {}", file_id);
+        debug!("Permanently deleted Drive file/folder: {}", file_id);
         Ok(())
     }
 }

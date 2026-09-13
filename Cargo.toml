@@ -26,4 +26,6 @@ sha2 = "0.10"
 base64 = "0.22"
 rand = "0.8"
 chrono = { version = "0.4", features = ["serde"] }
+indicatif = "0.17"
+clap_complete = "4.5"
 gdsync-core = { path = "crates/gdsync-core" }

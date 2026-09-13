@@ -26,6 +26,7 @@ const MANDATORY_IGNORES: &[&str] = &[
     ".cache/**",
     ".gdsync",
     ".gdsync/**",
+    ".gdsyncignore",
     "*.tmp",
     "*.swp",
     "*~",
@@ -47,7 +48,7 @@ pub struct GitignoreFilter {
 }
 
 impl GitignoreFilter {
-    /// Creates a new GitignoreFilter by inspecting root and nested `.gitignore` files.
+    /// Creates a new GitignoreFilter by inspecting root and nested `.gitignore` and `.gdsyncignore` files.
     pub fn new(root: &Path) -> Result<Self> {
         let canonical_root = std::fs::canonicalize(root)
             .with_context(|| format!("Failed to canonicalize filter root {:?}", root))?;
@@ -61,16 +62,17 @@ impl GitignoreFilter {
                 .with_context(|| format!("Failed to add mandatory pattern {}", pattern))?;
         }
 
-        // Recursively find and add all .gitignore files
+        // Recursively find and add all .gitignore and .gdsyncignore files
         for entry in WalkBuilder::new(&canonical_root)
             .hidden(false)
             .git_ignore(false)
             .build()
             .flatten()
         {
-            if entry.file_name() == ".gitignore" {
+            let name = entry.file_name();
+            if name == ".gitignore" || name == ".gdsyncignore" {
                 let path = entry.path();
-                debug!("Adding gitignore rules from {:?}", path);
+                debug!("Adding ignore rules from {:?}", path);
                 builder.add(path);
             }
         }
@@ -254,6 +256,23 @@ pub fn sanitize_filename_component(name: &str) -> String {
     candidate[..valid_end].to_string()
 }
 
+/// Formats a byte count into a human-readable string (B, KB, MB, GB).
+pub fn format_size(bytes: u64) -> String {
+    const KB: u64 = 1024;
+    const MB: u64 = KB * 1024;
+    const GB: u64 = MB * 1024;
+
+    if bytes >= GB {
+        format!("{:.2} GB", bytes as f64 / GB as f64)
+    } else if bytes >= MB {
+        format!("{:.2} MB", bytes as f64 / MB as f64)
+    } else if bytes >= KB {
+        format!("{:.2} KB", bytes as f64 / KB as f64)
+    } else {
+        format!("{} B", bytes)
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,5 +354,27 @@ mod tests {
         let clamped = sanitize_filename_component(&long_filename);
         assert!(clamped.as_bytes().len() <= 255);
         assert!(clamped.ends_with(".png"));
+    }
+
+    #[test]
+    fn test_gdsyncignore_support() -> Result<()> {
+        let dir = tempdir()?;
+        let root = dir.path();
+
+        // Create .gdsyncignore file
+        fs::write(root.join(".gdsyncignore"), "*.raw\ncustom_ignore/\n")?;
+        fs::write(root.join("photo.raw"), "raw-data")?;
+        fs::write(root.join("photo.jpg"), "jpg-data")?;
+        fs::create_dir_all(root.join("custom_ignore"))?;
+        fs::write(root.join("custom_ignore/test.txt"), "data")?;
+
+        let filter = GitignoreFilter::new(root)?;
+
+        assert!(filter.is_ignored(&root.join("photo.raw"), false));
+        assert!(filter.is_ignored(&root.join("custom_ignore/test.txt"), false));
+        assert!(!filter.is_ignored(&root.join("photo.jpg"), false));
+        assert!(filter.is_ignored(&root.join(".gdsyncignore"), false));
+
+        Ok(())
     }
 }
