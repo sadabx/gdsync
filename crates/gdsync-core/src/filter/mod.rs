@@ -190,6 +190,70 @@ pub fn compute_file_md5(path: &Path) -> Result<String> {
     Ok(hex::encode(digest))
 }
 
+/// Sanitizes a single filename component (file or directory name) from Google Drive
+/// or external sources to be fully valid, safe, and compliant with Linux filesystems (NAME_MAX <= 255 bytes).
+///
+/// Features:
+/// 1. Strips zero-width and invisible unicode characters (e.g. \u{200b} zero-width space, BOM, directional markers).
+/// 2. Strips null bytes and non-printable control characters.
+/// 3. Replaces directory separators ('/' or '\\') with '_'.
+/// 4. Trims leading/trailing whitespace.
+/// 5. Clamps byte length to <= 255 bytes on valid UTF-8 character boundaries, preserving file extension.
+pub fn sanitize_filename_component(name: &str) -> String {
+    let cleaned: String = name
+        .chars()
+        .filter(|&c| {
+            !matches!(
+                c,
+                '\0' | '\u{200B}'..='\u{200F}' | '\u{202A}'..='\u{202E}' | '\u{2060}' | '\u{FEFF}'
+            ) && !c.is_control()
+        })
+        .map(|c| if c == '/' || c == '\\' { '_' } else { c })
+        .collect();
+
+    let cleaned = cleaned.trim();
+    let candidate = if cleaned.is_empty() {
+        "unnamed_file".to_string()
+    } else {
+        cleaned.to_string()
+    };
+
+    if candidate.as_bytes().len() <= 255 {
+        return candidate;
+    }
+
+    // If over 255 bytes, preserve extension if reasonably sized (<= 32 bytes)
+    if let Some(dot_idx) = candidate.rfind('.') {
+        let ext = &candidate[dot_idx..];
+        let stem = &candidate[..dot_idx];
+        if ext.as_bytes().len() <= 32 && ext.len() < candidate.len() {
+            let max_stem_bytes = 255 - ext.as_bytes().len();
+            let mut byte_count = 0;
+            let mut valid_stem_end = 0;
+            for (idx, ch) in stem.char_indices() {
+                if byte_count + ch.len_utf8() > max_stem_bytes {
+                    break;
+                }
+                byte_count += ch.len_utf8();
+                valid_stem_end = idx + ch.len_utf8();
+            }
+            return format!("{}{}", &stem[..valid_stem_end], ext);
+        }
+    }
+
+    // Truncate candidate to 255 bytes at a valid UTF-8 character boundary
+    let mut byte_count = 0;
+    let mut valid_end = 0;
+    for (idx, ch) in candidate.char_indices() {
+        if byte_count + ch.len_utf8() > 255 {
+            break;
+        }
+        byte_count += ch.len_utf8();
+        valid_end = idx + ch.len_utf8();
+    }
+    candidate[..valid_end].to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -252,5 +316,24 @@ mod tests {
         // MD5 of "hello world\n" is 6f5902ac237024bdd0c176cb93063dc4
         assert_eq!(md5, "6f5902ac237024bdd0c176cb93063dc4");
         Ok(())
+    }
+
+    #[test]
+    fn test_sanitize_filename_component() {
+        // Zero-width space test from user issue
+        let cod_with_zwsp = "C\u{200b}a\u{200b}l\u{200b}l\u{200b} \u{200b}o\u{200b}f\u{200b} \u{200b}D\u{200b}u\u{200b}t\u{200b}y\u{200b}®\u{200b}_\u{200b} \u{200b}M\u{200b}o\u{200b}d\u{200b}e\u{200b}r\u{200b}n\u{200b} \u{200b}W\u{200b}a\u{200b}r\u{200b}f\u{200b}a\u{200b}r\u{200b}e\u{200b}®\u{200b}\u{200b}\u{200b}\u{200b}\u{200b} 6_23_2025 10_47_01 AM.png";
+        let cleaned = sanitize_filename_component(cod_with_zwsp);
+        assert_eq!(cleaned, "Call of Duty®_ Modern Warfare® 6_23_2025 10_47_01 AM.png");
+        assert!(cleaned.as_bytes().len() <= 255);
+
+        // Slash replacement
+        assert_eq!(sanitize_filename_component("folder/subname.txt"), "folder_subname.txt");
+
+        // Enforce 255 bytes limit
+        let long_stem = "a".repeat(300);
+        let long_filename = format!("{}.png", long_stem);
+        let clamped = sanitize_filename_component(&long_filename);
+        assert!(clamped.as_bytes().len() <= 255);
+        assert!(clamped.ends_with(".png"));
     }
 }

@@ -317,11 +317,14 @@ async fn handle_sync(path: PathBuf) -> Result<()> {
 
     let summary = coordinator.reconcile().await?;
 
-    println!("\nReconciliation Completed Successfully!");
+    println!("\nReconciliation Completed!");
     println!("  Uploaded:   {} files", summary.files_uploaded);
     println!("  Downloaded: {} files", summary.files_downloaded);
     println!("  Deleted:    {} files", summary.files_deleted);
     println!("  Unchanged:  {} files", summary.files_unchanged);
+    if summary.files_failed > 0 {
+        println!("  Errors:     {} files (see logs above)", summary.files_failed);
+    }
 
     Ok(())
 }

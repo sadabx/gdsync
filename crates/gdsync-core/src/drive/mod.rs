@@ -239,7 +239,8 @@ impl DriveClient {
         while let Some((parent_id, rel_dir)) = queue.pop_front() {
             let children = self.list_children(&parent_id).await?;
             for child in children {
-                let child_rel_path = rel_dir.join(&child.name);
+                let sanitized_name = crate::filter::sanitize_filename_component(&child.name);
+                let child_rel_path = rel_dir.join(sanitized_name);
                 if child.is_folder() {
                     queue.push_back((child.id.clone(), child_rel_path));
                 } else {
@@ -503,7 +504,18 @@ impl DriveClient {
         let auth = self.auth_header().await?;
         let url = format!("{}/{}?alt=media", DRIVE_FILES_API, file_id);
 
-        if let Some(parent) = destination_path.parent() {
+        let sanitized_path = if let Some(filename) = destination_path.file_name() {
+            let clean = crate::filter::sanitize_filename_component(&filename.to_string_lossy());
+            if clean != filename.to_string_lossy() {
+                destination_path.with_file_name(clean)
+            } else {
+                destination_path.to_path_buf()
+            }
+        } else {
+            destination_path.to_path_buf()
+        };
+
+        if let Some(parent) = sanitized_path.parent() {
             std::fs::create_dir_all(parent)?;
         }
 
@@ -521,10 +533,10 @@ impl DriveClient {
         }
 
         let bytes = resp.bytes().await.context("Failed to read response body")?;
-        std::fs::write(destination_path, &bytes)
-            .with_context(|| format!("Failed to write downloaded file to {:?}", destination_path))?;
+        std::fs::write(&sanitized_path, &bytes)
+            .with_context(|| format!("Failed to write downloaded file to {:?}", sanitized_path))?;
 
-        debug!("Downloaded Drive file {} to {:?}", file_id, destination_path);
+        debug!("Downloaded Drive file {} to {:?}", file_id, sanitized_path);
         Ok(())
     }
 

@@ -1,6 +1,6 @@
 use crate::db::{Database, SyncRootRecord, TrackedFileRecord};
 use crate::drive::DriveClient;
-use crate::filter::{compute_file_md5, GitignoreFilter};
+use crate::filter::{compute_file_md5, sanitize_filename_component, GitignoreFilter};
 use crate::watcher::{FsChange, FsWatcher};
 use anyhow::{Context, Result};
 use std::path::{Path, PathBuf};
@@ -13,6 +13,7 @@ pub struct SyncSummary {
     pub files_downloaded: usize,
     pub files_deleted: usize,
     pub files_unchanged: usize,
+    pub files_failed: usize,
 }
 
 pub struct SyncCoordinator {
@@ -74,7 +75,8 @@ impl SyncCoordinator {
             files_uploaded: push_stats.files_uploaded,
             files_downloaded: pull_stats.files_downloaded,
             files_deleted: push_stats.files_deleted,
-            files_unchanged: push_stats.files_unchanged,
+            files_unchanged: push_stats.files_unchanged + pull_stats.files_unchanged,
+            files_failed: push_stats.files_failed + pull_stats.files_failed,
         })
     }
 
@@ -86,6 +88,7 @@ impl SyncCoordinator {
         let mut uploaded = 0;
         let mut unchanged = 0;
         let mut deleted = 0;
+        let mut failed = 0;
 
         // 1. Process local files
         for file in &local_files {
@@ -100,13 +103,14 @@ impl SyncCoordinator {
                 Ok(hash) => hash,
                 Err(err) => {
                     warn!("Failed to compute MD5 for {:?}: {}", abs_path, err);
+                    failed += 1;
                     continue;
                 }
             };
 
             let existing_db_record = self.db.get_file(&self.local_root, rel_path)?;
 
-            if let Some(record) = existing_db_record {
+            let upload_result = if let Some(record) = existing_db_record {
                 if record.md5_checksum == local_md5 {
                     unchanged += 1;
                     continue;
@@ -115,57 +119,62 @@ impl SyncCoordinator {
                 // File content modified -> update existing Drive file
                 info!("Uploading modified file: {:?}", rel_path);
                 let parent_dir = rel_path.parent().unwrap_or_else(|| Path::new(""));
-                let target_parent_id = self
+                let target_parent_id = match self
                     .drive
                     .ensure_remote_dir_path(&self.drive_root_id, parent_dir)
-                    .await?;
+                    .await
+                {
+                    Ok(id) => id,
+                    Err(err) => {
+                        error!("Failed to create remote directory for {:?}: {:#}", rel_path, err);
+                        failed += 1;
+                        continue;
+                    }
+                };
 
                 let file_name = rel_path.file_name().unwrap().to_string_lossy();
-                let drive_file = self
-                    .drive
+                self.drive
                     .upload_resumable(
                         &target_parent_id,
                         &file_name,
                         abs_path,
                         Some(&record.drive_id),
                     )
-                    .await?;
-
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs() as i64;
-
-                self.db.upsert_file(&TrackedFileRecord {
-                    local_root: self.local_root.clone(),
-                    rel_path: rel_path.clone(),
-                    drive_id: drive_file.id,
-                    md5_checksum: drive_file.md5_checksum.unwrap_or(local_md5),
-                    modified_secs: file.modified_secs,
-                    size_bytes: file.size_bytes,
-                    is_directory: false,
-                    last_sync_timestamp: now,
-                })?;
-
-                uploaded += 1;
+                    .await
             } else {
                 // New file -> check if already exists on Drive or upload new
                 info!("Uploading new file: {:?}", rel_path);
                 let parent_dir = rel_path.parent().unwrap_or_else(|| Path::new(""));
-                let target_parent_id = self
+                let target_parent_id = match self
                     .drive
                     .ensure_remote_dir_path(&self.drive_root_id, parent_dir)
-                    .await?;
+                    .await
+                {
+                    Ok(id) => id,
+                    Err(err) => {
+                        error!("Failed to create remote directory for {:?}: {:#}", rel_path, err);
+                        failed += 1;
+                        continue;
+                    }
+                };
 
                 let file_name = rel_path.file_name().unwrap().to_string_lossy();
 
                 // Check if already on Drive
-                let existing_remote = self
+                let existing_remote = match self
                     .drive
                     .find_child_by_name(&target_parent_id, &file_name)
-                    .await?;
+                    .await
+                {
+                    Ok(r) => r,
+                    Err(err) => {
+                        error!("Failed to check if remote file {:?} exists: {:#}", rel_path, err);
+                        failed += 1;
+                        continue;
+                    }
+                };
 
-                let drive_file = if let Some(remote) = existing_remote {
+                if let Some(remote) = existing_remote {
                     self.drive
                         .upload_resumable(
                             &target_parent_id,
@@ -173,30 +182,40 @@ impl SyncCoordinator {
                             abs_path,
                             Some(&remote.id),
                         )
-                        .await?
+                        .await
                 } else {
                     self.drive
                         .upload_resumable(&target_parent_id, &file_name, abs_path, None)
-                        .await?
-                };
+                        .await
+                }
+            };
 
-                let now = SystemTime::now()
-                    .duration_since(UNIX_EPOCH)
-                    .unwrap()
-                    .as_secs() as i64;
+            match upload_result {
+                Ok(drive_file) => {
+                    let now = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs() as i64;
 
-                self.db.upsert_file(&TrackedFileRecord {
-                    local_root: self.local_root.clone(),
-                    rel_path: rel_path.clone(),
-                    drive_id: drive_file.id,
-                    md5_checksum: drive_file.md5_checksum.unwrap_or(local_md5),
-                    modified_secs: file.modified_secs,
-                    size_bytes: file.size_bytes,
-                    is_directory: false,
-                    last_sync_timestamp: now,
-                })?;
+                    if let Err(e) = self.db.upsert_file(&TrackedFileRecord {
+                        local_root: self.local_root.clone(),
+                        rel_path: rel_path.clone(),
+                        drive_id: drive_file.id,
+                        md5_checksum: drive_file.md5_checksum.unwrap_or(local_md5),
+                        modified_secs: file.modified_secs,
+                        size_bytes: file.size_bytes,
+                        is_directory: false,
+                        last_sync_timestamp: now,
+                    }) {
+                        warn!("Failed to update database for {:?}: {}", rel_path, e);
+                    }
 
-                uploaded += 1;
+                    uploaded += 1;
+                }
+                Err(err) => {
+                    error!("Failed to upload file {:?}: {:#}", rel_path, err);
+                    failed += 1;
+                }
             }
         }
 
@@ -219,6 +238,7 @@ impl SyncCoordinator {
             files_downloaded: 0,
             files_deleted: deleted,
             files_unchanged: unchanged,
+            files_failed: failed,
         })
     }
 
@@ -226,16 +246,25 @@ impl SyncCoordinator {
     pub async fn pull_reconcile(&self) -> Result<SyncSummary> {
         let mut downloaded = 0;
         let mut unchanged = 0;
+        let mut failed = 0;
 
         let filter = GitignoreFilter::new(&self.local_root)?;
         let mut queue: std::collections::VecDeque<(String, PathBuf)> = std::collections::VecDeque::new();
         queue.push_back((self.drive_root_id.clone(), PathBuf::new()));
 
         while let Some((remote_folder_id, relative_dir)) = queue.pop_front() {
-            let children = self.drive.list_children(&remote_folder_id).await?;
+            let children = match self.drive.list_children(&remote_folder_id).await {
+                Ok(c) => c,
+                Err(err) => {
+                    error!("Failed to list children for remote folder {}: {:#}", remote_folder_id, err);
+                    failed += 1;
+                    continue;
+                }
+            };
 
             for child in children {
-                let child_rel_path = relative_dir.join(&child.name);
+                let sanitized_name = sanitize_filename_component(&child.name);
+                let child_rel_path = relative_dir.join(&sanitized_name);
                 let child_abs_path = self.local_root.join(&child_rel_path);
 
                 if filter.is_ignored(&child_abs_path, child.is_folder()) {
@@ -244,7 +273,11 @@ impl SyncCoordinator {
 
                 if child.is_folder() {
                     if !child_abs_path.exists() {
-                        std::fs::create_dir_all(&child_abs_path)?;
+                        if let Err(e) = std::fs::create_dir_all(&child_abs_path) {
+                            error!("Failed to create local directory {:?}: {}", child_abs_path, e);
+                            failed += 1;
+                            continue;
+                        }
                     }
                     queue.push_back((child.id, child_rel_path));
                 } else {
@@ -262,33 +295,48 @@ impl SyncCoordinator {
 
                     if needs_download {
                         info!("Downloading remote file: {:?}", child_rel_path);
-                        self.drive.download_file(&child.id, &child_abs_path).await?;
+                        match self.drive.download_file(&child.id, &child_abs_path).await {
+                            Ok(()) => {
+                                match std::fs::metadata(&child_abs_path) {
+                                    Ok(metadata) => {
+                                        let mtime = metadata
+                                            .modified()
+                                            .ok()
+                                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
+                                            .map(|d| d.as_secs() as i64)
+                                            .unwrap_or(0);
 
-                        let metadata = std::fs::metadata(&child_abs_path)?;
-                        let mtime = metadata
-                            .modified()
-                            .ok()
-                            .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
-                            .map(|d| d.as_secs() as i64)
-                            .unwrap_or(0);
+                                        let now = SystemTime::now()
+                                            .duration_since(UNIX_EPOCH)
+                                            .unwrap()
+                                            .as_secs() as i64;
 
-                        let now = SystemTime::now()
-                            .duration_since(UNIX_EPOCH)
-                            .unwrap()
-                            .as_secs() as i64;
+                                        if let Err(e) = self.db.upsert_file(&TrackedFileRecord {
+                                            local_root: self.local_root.clone(),
+                                            rel_path: child_rel_path,
+                                            drive_id: child.id,
+                                            md5_checksum: remote_md5,
+                                            modified_secs: mtime,
+                                            size_bytes: metadata.len(),
+                                            is_directory: false,
+                                            last_sync_timestamp: now,
+                                        }) {
+                                            warn!("Failed to update database for {:?}: {}", child_abs_path, e);
+                                        }
 
-                        self.db.upsert_file(&TrackedFileRecord {
-                            local_root: self.local_root.clone(),
-                            rel_path: child_rel_path,
-                            drive_id: child.id,
-                            md5_checksum: remote_md5,
-                            modified_secs: mtime,
-                            size_bytes: metadata.len(),
-                            is_directory: false,
-                            last_sync_timestamp: now,
-                        })?;
-
-                        downloaded += 1;
+                                        downloaded += 1;
+                                    }
+                                    Err(e) => {
+                                        warn!("Failed to read metadata for {:?}: {}", child_abs_path, e);
+                                        failed += 1;
+                                    }
+                                }
+                            }
+                            Err(err) => {
+                                error!("Failed to download remote file {:?}: {:#}", child_rel_path, err);
+                                failed += 1;
+                            }
+                        }
                     } else {
                         unchanged += 1;
                     }
@@ -301,6 +349,7 @@ impl SyncCoordinator {
             files_downloaded: downloaded,
             files_deleted: 0,
             files_unchanged: unchanged,
+            files_failed: failed,
         })
     }
 
