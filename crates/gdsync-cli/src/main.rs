@@ -14,13 +14,21 @@ use std::path::{Path, PathBuf};
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
+const BANNER: &str = r#"       _                      
+  __ _| |___ _  _ _ _  __     
+ / _` | (_-< || | ' \/ _|     
+ \__, |_/__/\_, |_||_\__|  v0.1.0 (CLI)
+ |___/      |__/              
+ [Git-Aware Realtime Google Drive Sync]
+"#;
+
 #[derive(Parser)]
 #[command(
     name = "gdsync",
-    author = "gdsync team",
+    author = "Sadab Hafiz <sadabhfiz@gmail.com>",
     version = "0.1.0",
     about = "High-performance Linux CLI daemon that syncs local directories with Google Drive respecting .gitignore rules",
-    long_about = None
+    before_help = BANNER
 )]
 struct Cli {
     #[command(subcommand)]
@@ -322,6 +330,7 @@ async fn handle_watch(path: PathBuf, debounce_override: Option<u64>) -> Result<(
     let dir_cfg = resolve_directory_config(&path)?;
     let debounce_ms = debounce_override.unwrap_or(dir_cfg.debounce_ms);
 
+    println!("{}", BANNER);
     println!("Starting gdsync daemon in watch mode...");
     println!("  Directory:    {:?}", dir_cfg.local_path);
     println!("  Drive Folder: {}", dir_cfg.drive_folder_id);

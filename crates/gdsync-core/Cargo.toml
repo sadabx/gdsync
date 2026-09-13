@@ -3,6 +3,8 @@ name = "gdsync-core"
 version = "0.1.0"
 edition = "2021"
 description = "Core library for gdsync daemon"
+license = "GPL-3.0-or-later"
+repository = "https://github.com/sadabx/gdsync"
 
 [dependencies]
 tokio = { workspace = true }
