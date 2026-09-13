@@ -1,0 +1,20 @@
+# Rust build artifacts
+/target
+
+# OS / Editor temporary files
+.DS_Store
+*.swp
+*.swo
+*~
+*.bak
+*.tmp
+
+# SQLite temporary / journal files
+*.db-shm
+*.db-wal
+*.db-journal
+
+# Environment / local configs
+.env
+.env.*
+!.env.example
