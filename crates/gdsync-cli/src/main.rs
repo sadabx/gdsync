@@ -6,9 +6,10 @@ use gdsync_core::config::{
     load_config, save_config, token_path, WatchedDirectory,
 };
 use gdsync_core::db::Database;
-use gdsync_core::drive::DriveClient;
+use gdsync_core::drive::{DriveClient, DriveFile};
 use gdsync_core::filter::GitignoreFilter;
 use gdsync_core::sync::SyncCoordinator;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
@@ -84,6 +85,15 @@ enum Commands {
         #[arg(default_value = ".")]
         path: PathBuf,
     },
+
+    /// Compare two Google Drive folders to inspect unique, duplicate, and modified files
+    Diff {
+        /// Google Drive folder ID of first folder (e.g. from browser URL)
+        folder1: String,
+
+        /// Google Drive folder ID of second folder
+        folder2: String,
+    },
 }
 
 #[tokio::main]
@@ -112,6 +122,7 @@ async fn main() -> Result<()> {
         Commands::Sync { path } => handle_sync(path).await?,
         Commands::Watch { path, debounce_ms } => handle_watch(path, debounce_ms).await?,
         Commands::Status { path } => handle_status(path)?,
+        Commands::Diff { folder1, folder2 } => handle_diff(folder1, folder2).await?,
     }
 
     Ok(())
@@ -389,3 +400,112 @@ fn format_size(bytes: u64) -> String {
         format!("{} B", bytes)
     }
 }
+
+async fn handle_diff(folder1: String, folder2: String) -> Result<()> {
+    println!("Connecting to Google Drive...");
+    let drive = DriveClient::from_auth().await?;
+
+    let meta1 = drive.get_file_metadata(&folder1).await
+        .with_context(|| format!("Failed to access Folder 1 (ID: {})", folder1))?;
+    let meta2 = drive.get_file_metadata(&folder2).await
+        .with_context(|| format!("Failed to access Folder 2 (ID: {})", folder2))?;
+
+    println!("Scanning Folder 1: '{}' (ID: {})...", meta1.name, folder1);
+    let files1 = drive.list_files_recursive(&folder1).await?;
+    println!("  Found {} files in Folder 1.", files1.len());
+
+    println!("Scanning Folder 2: '{}' (ID: {})...", meta2.name, folder2);
+    let files2 = drive.list_files_recursive(&folder2).await?;
+    println!("  Found {} files in Folder 2.\n", files2.len());
+
+    let map1: HashMap<PathBuf, &DriveFile> = files1.iter().map(|(p, f)| (p.clone(), f)).collect();
+    let map2: HashMap<PathBuf, &DriveFile> = files2.iter().map(|(p, f)| (p.clone(), f)).collect();
+
+    let mut identical = Vec::new();
+    let mut modified = Vec::new();
+    let mut only_in_1 = Vec::new();
+    let mut only_in_2 = Vec::new();
+
+    for (path, f1) in &map1 {
+        if let Some(f2) = map2.get(path) {
+            let md5_1 = f1.md5_checksum.as_deref().unwrap_or("");
+            let md5_2 = f2.md5_checksum.as_deref().unwrap_or("");
+            if !md5_1.is_empty() && md5_1 == md5_2 {
+                identical.push((path, f1.size_bytes()));
+            } else {
+                modified.push((path, f1, f2));
+            }
+        } else {
+            only_in_1.push((path, f1));
+        }
+    }
+
+    for (path, f2) in &map2 {
+        if !map1.contains_key(path) {
+            only_in_2.push((path, f2));
+        }
+    }
+
+    println!("============================================================");
+    println!("                  COMPARISON SUMMARY                        ");
+    println!("============================================================");
+    println!("  Folder 1: '{}' (Total: {} files)", meta1.name, files1.len());
+    println!("  Folder 2: '{}' (Total: {} files)", meta2.name, files2.len());
+    println!("------------------------------------------------------------");
+    println!("  Identical files (same MD5):       {}", identical.len());
+    println!("  Unique to Folder 1 (not in 2):    {}", only_in_1.len());
+    println!("  Unique to Folder 2 (not in 1):    {}", only_in_2.len());
+    println!("  Same name, different content:     {}", modified.len());
+    println!("============================================================\n");
+
+    if !only_in_1.is_empty() {
+        println!("--- Files UNIQUE to Folder 1 ({}) ---", folder1);
+        for (path, file) in only_in_1.iter().take(25) {
+            println!("  + {} ({})", path.display(), format_size(file.size_bytes()));
+        }
+        if only_in_1.len() > 25 {
+            println!("  ... and {} more files", only_in_1.len() - 25);
+        }
+        println!();
+    }
+
+    if !only_in_2.is_empty() {
+        println!("--- Files UNIQUE to Folder 2 ({}) ---", folder2);
+        for (path, file) in only_in_2.iter().take(25) {
+            println!("  + {} ({})", path.display(), format_size(file.size_bytes()));
+        }
+        if only_in_2.len() > 25 {
+            println!("  ... and {} more files", only_in_2.len() - 25);
+        }
+        println!();
+    }
+
+    if !modified.is_empty() {
+        println!("--- Files with SAME NAME but DIFFERENT CONTENT ---");
+        for (path, f1, f2) in modified.iter().take(25) {
+            println!(
+                "  * {} (F1: {}, F2: {})",
+                path.display(),
+                format_size(f1.size_bytes()),
+                format_size(f2.size_bytes())
+            );
+        }
+        if modified.len() > 25 {
+            println!("  ... and {} more files", modified.len() - 25);
+        }
+        println!();
+    }
+
+    if only_in_1.is_empty() && only_in_2.is_empty() && modified.is_empty() {
+        println!("Conclusion: Both folders are 100% IDENTICAL!");
+    } else if only_in_1.is_empty() && modified.is_empty() {
+        println!("Conclusion: Folder 1 is a complete SUBSET of Folder 2. Folder 2 contains all files from Folder 1 plus {} extra files.", only_in_2.len());
+    } else if only_in_2.is_empty() && modified.is_empty() {
+        println!("Conclusion: Folder 2 is a complete SUBSET of Folder 1. Folder 1 contains all files from Folder 2 plus {} extra files.", only_in_1.len());
+    } else {
+        println!("Conclusion: Both folders have unique files or modifications that differ.");
+    }
+
+    Ok(())
+}
+

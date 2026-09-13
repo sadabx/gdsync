@@ -4,7 +4,7 @@ use reqwest::{header, StatusCode};
 use serde::{Deserialize, Serialize};
 use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use tokio::sync::Mutex;
 use tracing::debug;
@@ -186,6 +186,27 @@ impl DriveClient {
         }
 
         Ok(all_files)
+    }
+
+    /// Recursively lists all files in a Google Drive folder tree, returning (relative_path, DriveFile).
+    pub async fn list_files_recursive(&self, root_id: &str) -> Result<Vec<(PathBuf, DriveFile)>> {
+        let mut results = Vec::new();
+        let mut queue = std::collections::VecDeque::new();
+        queue.push_back((root_id.to_string(), PathBuf::new()));
+
+        while let Some((parent_id, rel_dir)) = queue.pop_front() {
+            let children = self.list_children(&parent_id).await?;
+            for child in children {
+                let child_rel_path = rel_dir.join(&child.name);
+                if child.is_folder() {
+                    queue.push_back((child.id.clone(), child_rel_path));
+                } else {
+                    results.push((child_rel_path, child));
+                }
+            }
+        }
+
+        Ok(results)
     }
 
     /// Creates a new directory in Google Drive under the specified parent.
