@@ -16,19 +16,19 @@ use std::path::{Path, PathBuf};
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
-const BANNER: &str = r#"             _                      
-    __ _  __| |___ _   _ _ __   ___ 
-   / _` |/ _` / __| | | | '_ \ / __|
-   \__, |\__,_\___/\__, |_| |_|\___|  v0.1.0 (CLI)
-   |___/           |___/            
-   [Git-Aware Realtime Google Drive Sync]
+const BANNER: &str = r#"   .--.                _                        
+  |o_o |      __ _  __| |___  _   _ _ __   ___  
+  |:_/ |     / _` |/ _` (_-< | | | | '_ \ / __| 
+ //   \ \    \__, |\__,_/__/  \__, |_| |_|\___|  v0.2.0 (CLI)
+(|     |)    |___/            |___/             
+/'_   _/'\   [Git-Aware Realtime Google Drive Sync]
 "#;
 
 #[derive(Parser)]
 #[command(
     name = "gdsync",
     author = "Sadab Hafiz <sadabhfiz@gmail.com>",
-    version = "0.1.0",
+    version = env!("CARGO_PKG_VERSION"),
     about = "High-performance Linux CLI daemon that syncs local directories with Google Drive respecting .gitignore rules",
     before_help = BANNER
 )]

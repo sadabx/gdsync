@@ -11,6 +11,8 @@ const C_GREEN: &str = "\x1b[38;2;15;157;88m";
 const C_GRAY: &str = "\x1b[38;2;140;150;165m";
 const C_DIM: &str = "\x1b[38;2;90;100;115m";
 const C_BOLD: &str = "\x1b[1m";
+const C_YELLOW: &str = "\x1b[38;2;251;188;4m";
+const C_WHITE: &str = "\x1b[38;2;240;240;245m";
 const C_RESET: &str = "\x1b[0m";
 
 fn get_auth_status() -> String {
@@ -70,14 +72,15 @@ pub fn print_dashboard_header() {
     };
 
     println!();
-    println!("  {C_BOLD}Welcome to gdsync v0.1.0{C_RESET}");
+    println!("  {C_BOLD}Welcome to gdsync v{}{C_RESET}", env!("CARGO_PKG_VERSION"));
     println!("  {C_DIM}Git-Aware Realtime Google Drive Sync Environment{C_RESET}");
     println!("  {C_DIM}─────────────────────────────────────────────────────────────────────────────{C_RESET}");
-    println!("             {C_BLUE}_{C_RESET}                     ");
-    println!("    {C_BLUE}__ _  __| |___ _   _ _ __   ___{C_RESET}     Google Drive:  {auth_status}");
-    println!("   {C_BLUE}/ _` |/ _` / __| | | | '_ \\ / __|{C_RESET}    Directories:   {dirs_info}");
-    println!("   {C_ORANGE}\\__, |\\__,_\\___/\\__, |_| |_|\\___|{C_RESET}    Local State:   {db_status}");
-    println!("   {C_ORANGE}|___/           |___/            {C_RESET}    Daemon:        {service_status}");
+    println!("     {C_WHITE}.--.{C_RESET}                {C_BLUE}_{C_RESET}                        ");
+    println!("    {C_WHITE}|{C_RESET}{C_YELLOW}o{C_RESET}{C_WHITE}_{C_RESET}{C_YELLOW}o{C_RESET}{C_WHITE} |{C_RESET}      {C_BLUE}__ _  __| |___  _   _ _ __   ___{C_RESET}     Google Drive:  {auth_status}");
+    println!("    {C_WHITE}|{C_RESET}{C_YELLOW}:_/{C_RESET}{C_WHITE} |{C_RESET}     {C_BLUE}/ _` |/ _` (_-< | | | | '_ \\ / __|{C_RESET}    Directories:   {dirs_info}");
+    println!("   {C_WHITE}//   \\ \\{C_RESET}    {C_ORANGE}\\__, |\\__,_/__/  \\__, |_| |_|\\___|{C_RESET}    Local State:   {db_status}");
+    println!("  {C_WHITE}(|     |){C_RESET}   {C_ORANGE}|___/            |___/            {C_RESET}    Daemon:        {service_status}");
+    println!("  {C_YELLOW}/'_   _/'\\{C_RESET}");
     println!("  {C_DIM}─────────────────────────────────────────────────────────────────────────────{C_RESET}");
     println!("  {C_BOLD}Let's get started.{C_RESET}\n");
 }

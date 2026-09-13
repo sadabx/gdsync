@@ -3,7 +3,7 @@
   <h1>gdsync</h1>
   <p><b>Git-aware real-time Google Drive sync daemon for Linux.</b></p>
   <p>
-    <a href="https://github.com/sadabx/gdsync/releases"><img src="https://img.shields.io/badge/Release-v0.1.0-blue?style=flat-square" alt="Release"></a>
+    <a href="https://github.com/sadabx/gdsync/releases"><img src="https://img.shields.io/badge/Release-v0.2.0-blue?style=flat-square" alt="Release"></a>
     <img src="https://img.shields.io/badge/Rust-1.75%2B-orange?style=flat-square&logo=rust&logoColor=white" alt="Rust">
     <img src="https://img.shields.io/badge/Platform-Linux-green?style=flat-square&logo=linux&logoColor=white" alt="Linux">
     <a href="LICENSE"><img src="https://img.shields.io/badge/License-GPL--3.0-blue.svg?style=flat-square" alt="License"></a>
