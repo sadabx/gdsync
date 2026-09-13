@@ -18,6 +18,7 @@ Google Drive for Desktop syncs everything indiscriminately—uploading `node_mod
 
 ## Features
 
+- **Interactive TUI Environment**: Run bare `gdsync` for a Claude Code-inspired terminal dashboard with live Google Drive connection status, tracked directories, and arrow-key action menus.
 - **Respects `.gitignore` & `.gdsyncignore`**: Automatically ignores build bloat (`node_modules/`, `target/`, `.venv/`, `.cxx/`) across root and nested subdirectories. Custom `.gdsyncignore` works in non-Git folders.
 - **Concurrent Transfers & Progress Bars**: Multi-threaded uploads/downloads with bounded worker pools and real-time progress bars (`indicatif`).
 - **Zero-Data-Loss Safe Trashing**: Local deletions move remote files to Google Drive's Trash (recoverable for 30 days) instead of permanently purging them.
@@ -39,7 +40,17 @@ cd gdsync
 cargo install --path crates/gdsync-cli
 ```
 
-### 2. Authenticate
+### 2. Interactive Environment or Direct CLI
+
+You can run `gdsync` by itself at any time to enter the interactive TUI menu:
+
+```bash
+gdsync
+```
+
+Or execute commands directly:
+
+### 3. Authenticate
 
 ```bash
 gdsync auth
@@ -47,7 +58,7 @@ gdsync auth
 
 *Opens your browser to complete Google OAuth2 PKCE login. Tokens are cached locally in `~/.config/gdsync/token.json`.*
 
-### 3. Link & Watch a Folder
+### 4. Link & Watch a Folder
 
 ```bash
 # Link your workspace to a Drive folder

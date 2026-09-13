@@ -1,3 +1,5 @@
+mod interactive;
+
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
 use gdsync_core::auth::execute_oauth_login;
@@ -32,7 +34,7 @@ const BANNER: &str = r#"       _
 )]
 struct Cli {
     #[command(subcommand)]
-    command: Commands,
+    command: Option<Commands>,
 
     /// Verbosity level (-v for debug, -vv for trace)
     #[arg(short, long, action = clap::ArgAction::Count, global = true)]
@@ -40,7 +42,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
-enum Commands {
+pub(crate) enum Commands {
     /// Authenticate with Google Drive via OAuth2 PKCE in browser
     Auth {
         /// Custom Google OAuth2 Client ID (overrides default/config)
@@ -155,7 +157,7 @@ enum Commands {
 }
 
 #[derive(Subcommand)]
-enum ServiceCommands {
+pub(crate) enum ServiceCommands {
     /// Install, enable, and start gdsync as a systemd user service
     Install,
     /// Check status of gdsync systemd user service
@@ -187,40 +189,43 @@ async fn main() -> Result<()> {
     let _ = tracing::subscriber::set_global_default(subscriber);
 
     match cli.command {
-        Commands::Auth {
-            client_id,
-            client_secret,
-        } => handle_auth(client_id, client_secret).await?,
-        Commands::Init { path, drive_folder } => handle_init(path, drive_folder).await?,
-        Commands::Scan { path } => handle_scan(path)?,
-        Commands::Sync {
-            path,
-            dry_run,
-            concurrency,
-            permanent_delete,
-        } => handle_sync(path, dry_run, concurrency, permanent_delete).await?,
-        Commands::Watch {
-            path,
-            debounce_ms,
-            concurrency,
-            permanent_delete,
-            notify,
-        } => handle_watch(path, debounce_ms, concurrency, permanent_delete, notify).await?,
-        Commands::Status { path } => handle_status(path)?,
-        Commands::Diff { folder1, folder2 } => handle_diff(folder1, folder2).await?,
-        Commands::Merge {
-            source,
-            destination,
-            yes,
-        } => handle_merge(source, destination, yes).await?,
-        Commands::Completions { shell } => handle_completions(shell)?,
-        Commands::Service { command } => handle_service(command)?,
+        None => interactive::run_interactive_mode().await?,
+        Some(cmd) => match cmd {
+            Commands::Auth {
+                client_id,
+                client_secret,
+            } => handle_auth(client_id, client_secret).await?,
+            Commands::Init { path, drive_folder } => handle_init(path, drive_folder).await?,
+            Commands::Scan { path } => handle_scan(path)?,
+            Commands::Sync {
+                path,
+                dry_run,
+                concurrency,
+                permanent_delete,
+            } => handle_sync(path, dry_run, concurrency, permanent_delete).await?,
+            Commands::Watch {
+                path,
+                debounce_ms,
+                concurrency,
+                permanent_delete,
+                notify,
+            } => handle_watch(path, debounce_ms, concurrency, permanent_delete, notify).await?,
+            Commands::Status { path } => handle_status(path)?,
+            Commands::Diff { folder1, folder2 } => handle_diff(folder1, folder2).await?,
+            Commands::Merge {
+                source,
+                destination,
+                yes,
+            } => handle_merge(source, destination, yes).await?,
+            Commands::Completions { shell } => handle_completions(shell)?,
+            Commands::Service { command } => handle_service(command)?,
+        },
     }
 
     Ok(())
 }
 
-async fn handle_auth(
+pub(crate) async fn handle_auth(
     client_id: Option<String>,
     client_secret: Option<String>,
 ) -> Result<()> {
@@ -251,7 +256,7 @@ async fn handle_auth(
     Ok(())
 }
 
-async fn handle_init(path: PathBuf, drive_folder: Option<String>) -> Result<()> {
+pub(crate) async fn handle_init(path: PathBuf, drive_folder: Option<String>) -> Result<()> {
     let canonical = std::fs::canonicalize(&path)
         .with_context(|| format!("Directory does not exist: {:?}", path))?;
 
@@ -325,7 +330,7 @@ async fn handle_init(path: PathBuf, drive_folder: Option<String>) -> Result<()> 
     Ok(())
 }
 
-fn handle_scan(path: PathBuf) -> Result<()> {
+pub(crate) fn handle_scan(path: PathBuf) -> Result<()> {
     let canonical = std::fs::canonicalize(&path)
         .with_context(|| format!("Directory does not exist: {:?}", path))?;
 
@@ -366,7 +371,7 @@ fn handle_scan(path: PathBuf) -> Result<()> {
     Ok(())
 }
 
-async fn handle_sync(
+pub(crate) async fn handle_sync(
     path: PathBuf,
     dry_run: bool,
     concurrency: usize,
@@ -417,7 +422,7 @@ async fn handle_sync(
     Ok(())
 }
 
-async fn handle_watch(
+pub(crate) async fn handle_watch(
     path: PathBuf,
     debounce_override: Option<u64>,
     concurrency: usize,
@@ -464,14 +469,14 @@ async fn handle_watch(
     Ok(())
 }
 
-fn handle_completions(shell: clap_complete::Shell) -> Result<()> {
+pub(crate) fn handle_completions(shell: clap_complete::Shell) -> Result<()> {
     use clap::CommandFactory;
     let mut cmd = Cli::command();
     clap_complete::generate(shell, &mut cmd, "gdsync", &mut std::io::stdout());
     Ok(())
 }
 
-fn handle_service(cmd: ServiceCommands) -> Result<()> {
+pub(crate) fn handle_service(cmd: ServiceCommands) -> Result<()> {
     match cmd {
         ServiceCommands::Install => {
             let exe_path = std::env::current_exe()
@@ -565,7 +570,7 @@ fn notify_user(title: &str, message: &str) {
         .spawn();
 }
 
-fn handle_status(path: PathBuf) -> Result<()> {
+pub(crate) fn handle_status(path: PathBuf) -> Result<()> {
     let canonical = std::fs::canonicalize(&path).unwrap_or_else(|_| path.clone());
     let db = Database::open_default()?;
     let stats = db.get_db_stats()?;
@@ -644,7 +649,7 @@ fn format_size(bytes: u64) -> String {
     }
 }
 
-async fn handle_diff(folder1: String, folder2: String) -> Result<()> {
+pub(crate) async fn handle_diff(folder1: String, folder2: String) -> Result<()> {
     println!("Connecting to Google Drive...");
     let drive = DriveClient::from_auth().await?;
 
@@ -752,7 +757,7 @@ async fn handle_diff(folder1: String, folder2: String) -> Result<()> {
     Ok(())
 }
 
-async fn handle_merge(source: String, destination: String, yes: bool) -> Result<()> {
+pub(crate) async fn handle_merge(source: String, destination: String, yes: bool) -> Result<()> {
     println!("Connecting to Google Drive...");
     let drive = DriveClient::from_auth().await?;
 
