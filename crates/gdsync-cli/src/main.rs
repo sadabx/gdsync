@@ -5,7 +5,6 @@ use gdsync_core::config::{
     add_or_update_directory, config_path, database_path, find_directory_config,
     load_config, save_config, token_path, WatchedDirectory,
 };
-use std::io::Write;
 use gdsync_core::db::Database;
 use gdsync_core::drive::DriveClient;
 use gdsync_core::filter::GitignoreFilter;
@@ -124,49 +123,26 @@ async fn handle_auth(
 ) -> Result<()> {
     let mut cfg = load_config().unwrap_or_default();
 
-    let cid = match client_id.or(cfg.client_id.clone()) {
-        Some(id) if !id.trim().is_empty() => id.trim().to_string(),
-        _ => {
-            println!("=== Google Drive OAuth Setup ===");
-            println!("Google Drive requires an OAuth 2.0 Client ID (Desktop app).");
-            println!("If you don't have one yet:");
-            println!("  1. Go to https://console.cloud.google.com/apis/credentials");
-            println!("  2. Create an OAuth client ID with Application type: 'Desktop app'");
-            println!("  3. Enable 'Google Drive API' under APIs & Services > Library");
-            println!("  4. Add your email as a Test User under OAuth consent screen\n");
-
-            print!("Enter your Google OAuth Client ID: ");
-            std::io::stdout().flush()?;
-            let mut input_id = String::new();
-            std::io::stdin().read_line(&mut input_id)?;
-            let trimmed = input_id.trim().to_string();
-            if trimmed.is_empty() {
-                bail!("OAuth authentication cancelled: Client ID cannot be empty.");
-            }
-            trimmed
-        }
+    let (cid, csec) = if let Some(id) = client_id {
+        let sec = client_secret.or(cfg.client_secret.clone());
+        cfg.client_id = Some(id.clone());
+        cfg.client_secret = sec.clone();
+        save_config(&cfg)?;
+        (id, sec)
+    } else if let Some(ref id) = cfg.client_id {
+        (id.clone(), cfg.client_secret.clone())
+    } else {
+        (
+            gdsync_core::auth::DEFAULT_CLIENT_ID.to_string(),
+            Some(gdsync_core::auth::DEFAULT_CLIENT_SECRET.to_string()),
+        )
     };
 
-    let csec = match client_secret.or(cfg.client_secret.clone()) {
-        Some(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
-        _ => {
-            print!("Enter your Google OAuth Client Secret (optional, press Enter to skip): ");
-            std::io::stdout().flush()?;
-            let mut input_sec = String::new();
-            std::io::stdin().read_line(&mut input_sec)?;
-            let trimmed = input_sec.trim().to_string();
-            if trimmed.is_empty() {
-                None
-            } else {
-                Some(trimmed)
-            }
-        }
-    };
-
-    // Persist credentials in config so user doesn't need to re-type them
-    cfg.client_id = Some(cid.clone());
-    cfg.client_secret = csec.clone();
-    save_config(&cfg)?;
+    println!("Starting Google Drive authentication...");
+    if cid == gdsync_core::auth::DEFAULT_CLIENT_ID {
+        println!("Using default verified client credentials.");
+        println!("(Tip: You can pass --client-id / --client-secret to use your own Google Cloud project for dedicated quotas).\n");
+    }
 
     execute_oauth_login(&cid, csec).await?;
     Ok(())

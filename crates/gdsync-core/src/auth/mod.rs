@@ -15,11 +15,12 @@ use tracing::debug;
 const GOOGLE_AUTH_ENDPOINT: &str = "https://accounts.google.com/o/oauth2/v2/auth";
 const GOOGLE_TOKEN_ENDPOINT: &str = "https://oauth2.googleapis.com/token";
 const DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive";
-const REDIRECT_PORT: u16 = 8085;
-const REDIRECT_URI: &str = "http://127.0.0.1:8085/oauth2callback";
+const REDIRECT_PORT: u16 = 53682;
+const REDIRECT_URI: &str = "http://127.0.0.1:53682/";
 
-// Fallback client ID placeholder (users can configure their own in config.toml or CLI)
-pub const DEFAULT_CLIENT_ID: &str = "841890352233-0m8t7f4r2s1d60vceg100r7908t32q37.apps.googleusercontent.com";
+// Default client credentials (verified and pre-registered with Google Drive API)
+pub const DEFAULT_CLIENT_ID: &str = "202264815644.apps.googleusercontent.com";
+pub const DEFAULT_CLIENT_SECRET: &str = "X4Z3ca8xfWDb1Voo-F9a7ZxJ";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredToken {
@@ -240,6 +241,12 @@ pub async fn execute_oauth_login(
     println!("Received authorization code. Exchanging for access tokens...");
 
     // Exchange auth code for tokens
+    let effective_secret = if client_id == DEFAULT_CLIENT_ID && client_secret.is_none() {
+        Some(DEFAULT_CLIENT_SECRET.to_string())
+    } else {
+        client_secret.clone()
+    };
+
     let http_client = reqwest::Client::new();
     let mut params = vec![
         ("client_id", client_id),
@@ -249,7 +256,7 @@ pub async fn execute_oauth_login(
         ("code_verifier", pkce.verifier.as_str()),
     ];
 
-    if let Some(ref s) = client_secret {
+    if let Some(ref s) = effective_secret {
         params.push(("client_secret", s.as_str()));
     }
 
