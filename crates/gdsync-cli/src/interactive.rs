@@ -35,7 +35,7 @@ fn get_systemd_status() -> String {
             match status.as_str() {
                 "active" => format!("{}● Active (running){}", C_GREEN, C_RESET),
                 "inactive" => format!("{}○ Inactive (stopped){}", C_GRAY, C_RESET),
-                "failed" => format!("{}✖ Failed{}", C_ORANGE, C_RESET),
+                "failed" => format!("{}● Failed{}", C_ORANGE, C_RESET),
                 _ => format!("{}Not installed{}", C_GRAY, C_RESET),
             }
         }
@@ -73,11 +73,11 @@ pub fn print_dashboard_header() {
     println!("  {C_BOLD}Welcome to gdsync v0.1.0{C_RESET}");
     println!("  {C_DIM}Git-Aware Realtime Google Drive Sync Environment{C_RESET}");
     println!("  {C_DIM}─────────────────────────────────────────────────────────────────────────────{C_RESET}");
-    println!("         {C_BLUE}_{C_RESET}                      ☁️  {C_BOLD}Google Drive:{C_RESET}  {auth_status}");
-    println!("    {C_BLUE}__ _| |___ _  _ _ _  __{C_RESET}     📁  {C_BOLD}Directories:{C_RESET}   {dirs_info}");
-    println!("   {C_BLUE}/ _` | (_-< || | ' \\/ _|{C_RESET}     💾  {C_BOLD}Local State:{C_RESET}   {db_status}");
-    println!("   {C_ORANGE}\\__, |_/__/\\_, |_||_\\__|{C_RESET}     ⚡  {C_BOLD}Daemon:{C_RESET}        {service_status}");
-    println!("   {C_ORANGE}|___/      |__/{C_RESET}");
+    println!("             {C_BLUE}_{C_RESET}                     ");
+    println!("    {C_BLUE}__ _  __| |___ _   _ _ __   ___{C_RESET}     Google Drive:  {auth_status}");
+    println!("   {C_BLUE}/ _` |/ _` / __| | | | '_ \\ / __|{C_RESET}    Directories:   {dirs_info}");
+    println!("   {C_ORANGE}\\__, |\\__,_\\___/\\__, |_| |_|\\___|{C_RESET}    Local State:   {db_status}");
+    println!("   {C_ORANGE}|___/           |___/            {C_RESET}    Daemon:        {service_status}");
     println!("  {C_DIM}─────────────────────────────────────────────────────────────────────────────{C_RESET}");
     println!("  {C_BOLD}Let's get started.{C_RESET}\n");
 }
@@ -89,16 +89,16 @@ pub async fn run_interactive_mode() -> Result<()> {
         print_dashboard_header();
 
         let menu_items = vec![
-            "🔄  Run Two-Way Sync            Reconcile changes between local & Drive",
-            "👁️   Start Watch Daemon          Monitor and sync in real time (inotify)",
-            "🔍  Preview Scan (.gitignore)   Dry-run inspect payload and ignored files",
-            "📊  Status & Statistics         View tracked directories and SQLite health",
-            "🔗  Link New Directory          Map a local folder to Google Drive",
-            "⚖️   Compare Remote Folders      MD5 recursive diff between two Drive folders",
-            "🔀  Consolidate Folders (Merge) Non-destructively merge remote folders",
-            "⚙️   Systemd Service Manager     Manage background user daemon",
-            "🔑  Authenticate                Login with Google Drive via OAuth2 PKCE",
-            "🚪  Exit",
+            "1. Run Two-Way Sync          Reconcile changes between local & Drive",
+            "2. Start Watch Daemon        Monitor and sync in real time (inotify)",
+            "3. Preview Scan (.gitignore) Dry-run inspect payload and ignored files",
+            "4. Status & Statistics       View tracked directories and SQLite health",
+            "5. Link New Directory        Map a local folder to Google Drive",
+            "6. Compare Remote Folders    MD5 recursive diff between two Drive folders",
+            "7. Consolidate Folders       Non-destructively merge remote folders",
+            "8. Systemd Service Manager   Manage background user daemon",
+            "9. Authenticate              Login with Google Drive via OAuth2 PKCE",
+            "0. Exit",
         ];
 
         let selection = match Select::with_theme(&theme)
@@ -240,8 +240,8 @@ fn select_or_prompt_directory(action_name: &str) -> Result<Option<PathBuf>> {
 
     let mut options: Vec<String> = Vec::new();
 
-    for d in &config.directories {
-        options.push(format!("📁 {} (Drive ID: {})", d.local_path.display(), d.drive_folder_id));
+    for (i, d) in config.directories.iter().enumerate() {
+        options.push(format!("{}. {} (Drive ID: {})", i + 1, d.local_path.display(), d.drive_folder_id));
     }
 
     // If cwd is not already in the list, offer it as an option
@@ -251,11 +251,11 @@ fn select_or_prompt_directory(action_name: &str) -> Result<Option<PathBuf>> {
     });
 
     if !cwd_already_in_config {
-        options.push(format!("📍 Current directory ({})", cwd.display()));
+        options.push(format!("Current directory ({})", cwd.display()));
     }
 
-    options.push("✏️  Enter a custom path...".to_string());
-    options.push("⬅️  Cancel".to_string());
+    options.push("Enter custom path...".to_string());
+    options.push("Cancel".to_string());
 
     let selection = Select::with_theme(&theme)
         .with_prompt(format!("Choose directory to {}", action_name))
@@ -287,12 +287,12 @@ fn select_or_prompt_directory(action_name: &str) -> Result<Option<PathBuf>> {
 
 fn run_service_submenu(theme: &ColorfulTheme) -> Result<()> {
     let service_options = vec![
-        "📥  Install & Start Systemd Service (on boot)",
-        "📋  Check Service Status",
-        "📜  View Live Logs (journalctl)",
-        "🔄  Restart Service",
-        "🛑  Stop Service",
-        "⬅️  Back to Main Menu",
+        "1. Install & Start Systemd Service (on boot)",
+        "2. Check Service Status",
+        "3. View Live Logs (journalctl)",
+        "4. Restart Service",
+        "5. Stop Service",
+        "0. Back to Main Menu",
     ];
 
     let choice = match Select::with_theme(theme)

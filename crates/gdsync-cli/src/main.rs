@@ -16,12 +16,12 @@ use std::path::{Path, PathBuf};
 use tracing::Level;
 use tracing_subscriber::FmtSubscriber;
 
-const BANNER: &str = r#"       _                      
-  __ _| |___ _  _ _ _  __     
- / _` | (_-< || | ' \/ _|     
- \__, |_/__/\_, |_||_\__|  v0.1.0 (CLI)
- |___/      |__/              
- [Git-Aware Realtime Google Drive Sync]
+const BANNER: &str = r#"             _                      
+    __ _  __| |___ _   _ _ __   ___ 
+   / _` |/ _` / __| | | | '_ \ / __|
+   \__, |\__,_\___/\__, |_| |_|\___|  v0.1.0 (CLI)
+   |___/           |___/            
+   [Git-Aware Realtime Google Drive Sync]
 "#;
 
 #[derive(Parser)]
