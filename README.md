@@ -1,3 +1,4 @@
+
 <div align="center">
   <img src="assets/logo.svg" alt="gdsync Logo" width="120"/>
   <h1>gdsync</h1>
@@ -40,6 +41,7 @@ cargo install --path crates/gdsync-cli
 
 ```bash
 gdsync auth
+
 ```
 
 *Opens your browser to complete Google OAuth2 PKCE login. Tokens are cached locally in `~/.config/gdsync/token.json`.*
@@ -58,6 +60,7 @@ gdsync sync
 
 # Start the real-time background watcher daemon
 gdsync watch
+
 ```
 
 ---
@@ -96,6 +99,7 @@ RestartSec=5
 
 [Install]
 WantedBy=default.target
+
 ```
 
 2. Enable and start:
@@ -103,6 +107,7 @@ WantedBy=default.target
 ```bash
 systemctl --user daemon-reload
 systemctl --user enable --now gdsync.service
+
 ```
 
 ---
@@ -114,6 +119,7 @@ systemctl --user enable --now gdsync.service
 ├── config.toml    # Directory mappings and remote IDs
 ├── state.db       # SQLite WAL database (file hashes & IDs)
 └── token.json     # Stored OAuth2 tokens
+
 ```
 
 ---
