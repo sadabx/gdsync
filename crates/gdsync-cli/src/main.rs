@@ -1,10 +1,11 @@
 use anyhow::{bail, Context, Result};
 use clap::{Parser, Subcommand};
-use gdsync_core::auth::{execute_oauth_login, DEFAULT_CLIENT_ID};
+use gdsync_core::auth::execute_oauth_login;
 use gdsync_core::config::{
     add_or_update_directory, config_path, database_path, find_directory_config,
-    load_config, token_path, WatchedDirectory,
+    load_config, save_config, token_path, WatchedDirectory,
 };
+use std::io::Write;
 use gdsync_core::db::Database;
 use gdsync_core::drive::DriveClient;
 use gdsync_core::filter::GitignoreFilter;
@@ -121,12 +122,51 @@ async fn handle_auth(
     client_id: Option<String>,
     client_secret: Option<String>,
 ) -> Result<()> {
-    let cfg = load_config().unwrap_or_default();
-    let cid = client_id
-        .or(cfg.client_id)
-        .unwrap_or_else(|| DEFAULT_CLIENT_ID.to_string());
+    let mut cfg = load_config().unwrap_or_default();
 
-    let csec = client_secret.or(cfg.client_secret);
+    let cid = match client_id.or(cfg.client_id.clone()) {
+        Some(id) if !id.trim().is_empty() => id.trim().to_string(),
+        _ => {
+            println!("=== Google Drive OAuth Setup ===");
+            println!("Google Drive requires an OAuth 2.0 Client ID (Desktop app).");
+            println!("If you don't have one yet:");
+            println!("  1. Go to https://console.cloud.google.com/apis/credentials");
+            println!("  2. Create an OAuth client ID with Application type: 'Desktop app'");
+            println!("  3. Enable 'Google Drive API' under APIs & Services > Library");
+            println!("  4. Add your email as a Test User under OAuth consent screen\n");
+
+            print!("Enter your Google OAuth Client ID: ");
+            std::io::stdout().flush()?;
+            let mut input_id = String::new();
+            std::io::stdin().read_line(&mut input_id)?;
+            let trimmed = input_id.trim().to_string();
+            if trimmed.is_empty() {
+                bail!("OAuth authentication cancelled: Client ID cannot be empty.");
+            }
+            trimmed
+        }
+    };
+
+    let csec = match client_secret.or(cfg.client_secret.clone()) {
+        Some(s) if !s.trim().is_empty() => Some(s.trim().to_string()),
+        _ => {
+            print!("Enter your Google OAuth Client Secret (optional, press Enter to skip): ");
+            std::io::stdout().flush()?;
+            let mut input_sec = String::new();
+            std::io::stdin().read_line(&mut input_sec)?;
+            let trimmed = input_sec.trim().to_string();
+            if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            }
+        }
+    };
+
+    // Persist credentials in config so user doesn't need to re-type them
+    cfg.client_id = Some(cid.clone());
+    cfg.client_secret = csec.clone();
+    save_config(&cfg)?;
 
     execute_oauth_login(&cid, csec).await?;
     Ok(())
