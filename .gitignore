@@ -18,3 +18,6 @@
 .env
 .env.*
 !.env.example
+token.json
+*.db
+config.toml
