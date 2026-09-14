@@ -35,12 +35,26 @@ Google Drive for Desktop syncs everything indiscriminately—uploading `node_mod
 
 ### 1. Installation
 
+**One-line install (Linux x86_64 / aarch64)**:
+
 ```bash
-# Clone & Install
+curl -fsSL https://raw.githubusercontent.com/sadabx/gdsync/main/install.sh | bash
+```
+
+<details>
+<summary><b>Alternative: Build from source via Cargo</b></summary>
+<br/>
+
+```bash
+# Direct install from Git
+cargo install --git https://github.com/sadabx/gdsync.git gdsync-cli
+
+# Or clone and compile locally
 git clone https://github.com/sadabx/gdsync.git
 cd gdsync
 cargo install --path crates/gdsync-cli
 ```
+</details>
 
 ### 2. Interactive Environment or Direct CLI
 
