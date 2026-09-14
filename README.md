@@ -24,7 +24,9 @@ Google Drive for Desktop syncs everything indiscriminately—uploading `node_mod
 - **Zero-Data-Loss Safe Trashing**: Local deletions move remote files to Google Drive's Trash (recoverable for 30 days) instead of permanently purging them.
 - **Kernel-Level Watching**: Debounces rapid file changes with `inotify` before uploading.
 - **SQLite State Tracking**: Tracks paths, MD5 checksums, and Google Drive file IDs locally in `~/.config/gdsync/state.db`.
-- **Resumable Chunked Uploads**: Direct asynchronous Google Drive v3 REST API implementation with automatic exponential backoff retry.
+- **Automatic Conflict Preservation**: Detects offline two-way edits and preserves local modifications as `<file>.conflict-<timestamp>.<ext>` while pulling remote changes with zero data loss.
+- **Cascading Deletion Safety Guard**: Automatically blocks mass deletions (>20% or >50 files) if an external drive or network share unmounts unexpectedly (bypassable with `--force`).
+- **Resumable Chunked Uploads**: Direct asynchronous Google Drive v3 REST API implementation with automatic exponential backoff retry and chunk recovery.
 - **Built-in Systemd Daemon & Shell Completions**: Integrated service helper and auto-completions for Bash, Zsh, and Fish.
 
 ---
@@ -86,8 +88,8 @@ gdsync watch
 | `auth` | `gdsync auth [--client-id <ID> --client-secret <SEC>]` | Google Drive OAuth2 login |
 | `init` | `gdsync init <local_path> -d <remote_folder_or_id>` | Map a local directory to Google Drive |
 | `scan` | `gdsync scan [path]` | Dry-run list of files to sync (respecting `.gitignore`) |
-| `sync` | `gdsync sync [path] [--dry-run] [--concurrency <N>]` | Two-way reconciliation with progress bars |
-| `watch` | `gdsync watch [path] [--notify]` | Start real-time inotify watcher daemon |
+| `sync` | `gdsync sync [path] [--dry-run] [--concurrency <N>] [--force]` | Two-way reconciliation with progress bars & safety guards |
+| `watch` | `gdsync watch [path] [--notify] [--force]` | Start real-time inotify watcher daemon |
 | `status` | `gdsync status` | Show tracked paths, database records, and sync queue |
 | `diff` | `gdsync diff <remote_folder1> <remote_folder2>` | Compare two remote Drive folders via MD5 |
 | `merge` | `gdsync merge <source_folder> <target_folder>` | Non-destructively merge remote folders |
