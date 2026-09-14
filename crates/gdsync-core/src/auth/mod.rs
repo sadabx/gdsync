@@ -19,8 +19,11 @@ const REDIRECT_PORT: u16 = 53682;
 const REDIRECT_URI: &str = "http://127.0.0.1:53682/";
 
 // Default client credentials (verified and pre-registered with Google Drive API)
-pub const DEFAULT_CLIENT_ID: &str = "202264815644.apps.googleusercontent.com";
-pub const DEFAULT_CLIENT_SECRET: &str = "X4Z3ca8xfWDb1Voo-F9a7ZxJ";
+pub const DEFAULT_CLIENT_ID: &str = match option_env!("GDSYNC_CLIENT_ID") {
+    Some(id) => id,
+    None => "202264815644.apps.googleusercontent.com",
+};
+pub const DEFAULT_CLIENT_SECRET: Option<&str> = option_env!("GDSYNC_CLIENT_SECRET");
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct StoredToken {
@@ -242,7 +245,7 @@ pub async fn execute_oauth_login(
 
     // Exchange auth code for tokens
     let effective_secret = if client_id == DEFAULT_CLIENT_ID && client_secret.is_none() {
-        Some(DEFAULT_CLIENT_SECRET.to_string())
+        DEFAULT_CLIENT_SECRET.map(ToString::to_string)
     } else {
         client_secret.clone()
     };

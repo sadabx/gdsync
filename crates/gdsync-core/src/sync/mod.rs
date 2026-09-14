@@ -1,13 +1,16 @@
 use crate::db::{Database, SyncRootRecord, TrackedFileRecord};
 use crate::drive::DriveClient;
-use crate::filter::{compute_file_md5, format_size, sanitize_filename_component, GitignoreFilter};
+use crate::filter::{
+    compute_file_md5_async, format_size, sanitize_filename_component, GitignoreFilter,
+};
 use crate::watcher::{FsChange, FsWatcher};
-use anyhow::{Context, Result};
+use anyhow::{bail, Context, Result};
 use indicatif::{ProgressBar, ProgressStyle};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::{mpsc, Semaphore};
+use tokio::sync::{mpsc, RwLock, Semaphore};
 use tokio::task::JoinSet;
 use tracing::{error, info, warn};
 
@@ -17,6 +20,7 @@ pub struct SyncOptions {
     pub permanent_delete: bool,
     pub concurrency: usize,
     pub show_progress: bool,
+    pub force: bool,
 }
 
 impl Default for SyncOptions {
@@ -26,6 +30,7 @@ impl Default for SyncOptions {
             permanent_delete: false,
             concurrency: 4,
             show_progress: true,
+            force: false,
         }
     }
 }
@@ -53,6 +58,7 @@ struct DownloadItem {
     child_abs_path: PathBuf,
     remote_md5: String,
     size_bytes: u64,
+    export_mime: Option<String>,
 }
 
 pub struct SyncCoordinator {
@@ -60,6 +66,7 @@ pub struct SyncCoordinator {
     drive_root_id: String,
     drive: DriveClient,
     db: Database,
+    dir_cache: Arc<RwLock<HashMap<PathBuf, String>>>,
 }
 
 impl SyncCoordinator {
@@ -86,12 +93,35 @@ impl SyncCoordinator {
             last_sync_at: now,
         })?;
 
+        let mut initial_cache = HashMap::new();
+        initial_cache.insert(PathBuf::new(), drive_root_id.clone());
+
         Ok(Self {
             local_root: canonical,
             drive_root_id,
             drive,
             db,
+            dir_cache: Arc::new(RwLock::new(initial_cache)),
         })
+    }
+
+    /// Resolves and caches a remote directory ID for a relative path.
+    pub async fn ensure_remote_dir_cached(&self, rel_dir: &Path) -> Result<String> {
+        let rel_buf = rel_dir.to_path_buf();
+        {
+            let cache = self.dir_cache.read().await;
+            if let Some(id) = cache.get(&rel_buf) {
+                return Ok(id.clone());
+            }
+        }
+
+        let id = self
+            .drive
+            .ensure_remote_dir_path(&self.drive_root_id, rel_dir)
+            .await?;
+        let mut cache = self.dir_cache.write().await;
+        cache.insert(rel_buf, id.clone());
+        Ok(id)
     }
 
     /// Runs a full push-and-pull reconciliation pass with default options.
@@ -137,6 +167,13 @@ impl SyncCoordinator {
 
     /// Scans local files, respecting .gitignore, and pushes new/modified files to Drive.
     pub async fn push_reconcile_with_options(&self, options: &SyncOptions) -> Result<SyncSummary> {
+        if !self.local_root.exists() {
+            bail!(
+                "Sync root directory {:?} does not exist or is unmounted! Aborting sync to prevent cascading remote deletion.",
+                self.local_root
+            );
+        }
+
         let filter = GitignoreFilter::new(&self.local_root)?;
         let local_files = filter.walk_unignored();
 
@@ -155,7 +192,7 @@ impl SyncCoordinator {
             let rel_path = &file.relative_path;
             let abs_path = &file.absolute_path;
 
-            let local_md5 = match compute_file_md5(abs_path) {
+            let local_md5 = match compute_file_md5_async(abs_path.clone()).await {
                 Ok(hash) => hash,
                 Err(err) => {
                     warn!("Failed to compute MD5 for {:?}: {}", abs_path, err);
@@ -172,7 +209,72 @@ impl SyncCoordinator {
                     continue;
                 }
 
-                if options.dry_run {
+                // File was modified locally! Check for two-way conflict with remote
+                let is_conflict = match self.drive.get_file_metadata(&record.drive_id).await {
+                    Ok(remote) => {
+                        if let Some(ref remote_md5) = remote.md5_checksum {
+                            // If remote MD5 also differs from last sync record, both local and remote changed
+                            remote_md5 != &record.md5_checksum
+                        } else {
+                            false
+                        }
+                    }
+                    Err(_) => false,
+                };
+
+                if is_conflict {
+                    let file_stem = abs_path
+                        .file_stem()
+                        .map(|s| s.to_string_lossy().to_string())
+                        .unwrap_or_else(|| "file".to_string());
+                    let extension = abs_path
+                        .extension()
+                        .map(|e| format!(".{}", e.to_string_lossy()))
+                        .unwrap_or_default();
+                    let now_secs = SystemTime::now()
+                        .duration_since(UNIX_EPOCH)
+                        .unwrap()
+                        .as_secs();
+                    let conflict_filename = format!("{}.conflict-{}{}", file_stem, now_secs, extension);
+                    let conflict_rel = rel_path
+                        .parent()
+                        .map(|p| p.join(&conflict_filename))
+                        .unwrap_or_else(|| PathBuf::from(&conflict_filename));
+                    let conflict_abs = abs_path
+                        .parent()
+                        .map(|p| p.join(&conflict_filename))
+                        .unwrap_or_else(|| PathBuf::from(&conflict_filename));
+
+                    if options.dry_run {
+                        println!(
+                            "  [CONFLICT] {:?} modified both locally and remotely! Local copy will be saved as {:?}",
+                            rel_path, conflict_rel
+                        );
+                        uploaded += 1;
+                    } else {
+                        warn!(
+                            "Conflict detected on {:?}: modified both locally and on Google Drive. Renaming local copy to {:?}",
+                            rel_path, conflict_rel
+                        );
+                        if let Err(e) = std::fs::rename(abs_path, &conflict_abs) {
+                            error!(
+                                "Failed to rename conflicting file {:?} to {:?}: {}",
+                                abs_path, conflict_abs, e
+                            );
+                            failed += 1;
+                            continue;
+                        }
+
+                        upload_items.push(UploadItem {
+                            rel_path: conflict_rel,
+                            abs_path: conflict_abs,
+                            local_md5,
+                            modified_secs: file.modified_secs,
+                            size_bytes: file.size_bytes,
+                            existing_drive_id: None,
+                        });
+                    }
+                } else if options.dry_run {
                     println!("  [UPLOAD:MODIFIED] {:?} ({})", rel_path, format_size(file.size_bytes));
                     uploaded += 1;
                 } else {
@@ -185,60 +287,99 @@ impl SyncCoordinator {
                         existing_drive_id: Some(record.drive_id),
                     });
                 }
+            } else if options.dry_run {
+                println!("  [UPLOAD:NEW] {:?} ({})", rel_path, format_size(file.size_bytes));
+                uploaded += 1;
             } else {
-                if options.dry_run {
-                    println!("  [UPLOAD:NEW] {:?} ({})", rel_path, format_size(file.size_bytes));
-                    uploaded += 1;
-                } else {
-                    upload_items.push(UploadItem {
-                        rel_path: rel_path.clone(),
-                        abs_path: abs_path.clone(),
-                        local_md5,
-                        modified_secs: file.modified_secs,
-                        size_bytes: file.size_bytes,
-                        existing_drive_id: None,
-                    });
-                }
+                upload_items.push(UploadItem {
+                    rel_path: rel_path.clone(),
+                    abs_path: abs_path.clone(),
+                    local_md5,
+                    modified_secs: file.modified_secs,
+                    size_bytes: file.size_bytes,
+                    existing_drive_id: None,
+                });
             }
         }
 
         // 2. Detect locally deleted files
         let all_tracked = self.db.list_files_for_root(&self.local_root)?;
+        let total_tracked = all_tracked.len();
+        let mut missing_records = Vec::new();
+
         for record in all_tracked {
             let local_abs = self.local_root.join(&record.rel_path);
             if !local_abs.exists() {
-                if options.dry_run {
-                    let action = if options.permanent_delete { "DELETE" } else { "TRASH" };
-                    println!("  [{}] {:?}", action, record.rel_path);
-                    deleted += 1;
-                } else {
-                    let action_res = if options.permanent_delete {
-                        info!("Permanently deleting remote file for missing local file: {:?}", record.rel_path);
-                        self.drive.delete_file(&record.drive_id).await
-                    } else {
-                        info!("Moving remote file to trash for missing local file: {:?}", record.rel_path);
-                        self.drive.trash_file(&record.drive_id).await
-                    };
+                missing_records.push(record);
+            }
+        }
 
-                    if let Err(err) = action_res {
-                        warn!("Failed to delete/trash remote Drive file {}: {}", record.drive_id, err);
-                    }
-                    self.db.delete_file(&self.local_root, &record.rel_path)?;
-                    deleted += 1;
+        let delete_count = missing_records.len();
+        let exceeds_threshold = delete_count > 50 || (total_tracked >= 10 && delete_count * 5 > total_tracked);
+
+        if exceeds_threshold {
+            if options.dry_run {
+                println!(
+                    "  [SAFETY WARNING] Deletion of {} of {} files exceeds safe threshold (>20% or >50 files). Actual run will require `--force`.",
+                    delete_count, total_tracked
+                );
+            } else if !options.force {
+                bail!(
+                    "Safety guard triggered: deletion of {} files exceeds safe threshold (total tracked: {}). \
+                     This often occurs if an external drive was unmounted or folder moved. \
+                     If this is intentional, re-run with `--force` to proceed.",
+                    delete_count, total_tracked
+                );
+            }
+        }
+
+        for record in missing_records {
+            if options.dry_run {
+                let action = if options.permanent_delete { "DELETE" } else { "TRASH" };
+                println!("  [{}] {:?}", action, record.rel_path);
+                deleted += 1;
+            } else {
+                let action_res = if options.permanent_delete {
+                    info!(
+                        "Permanently deleting remote file for missing local file: {:?}",
+                        record.rel_path
+                    );
+                    self.drive.delete_file(&record.drive_id).await
+                } else {
+                    info!(
+                        "Moving remote file to trash for missing local file: {:?}",
+                        record.rel_path
+                    );
+                    self.drive.trash_file(&record.drive_id).await
+                };
+
+                if let Err(err) = action_res {
+                    warn!(
+                        "Failed to delete/trash remote Drive file {}: {}",
+                        record.drive_id, err
+                    );
                 }
+                self.db.delete_file(&self.local_root, &record.rel_path)?;
+                deleted += 1;
             }
         }
 
         // 3. Perform uploads concurrently (if not dry-run)
         if !options.dry_run && !upload_items.is_empty() {
-            let mut parent_map = std::collections::HashMap::new();
+            let mut parent_map = HashMap::new();
             parent_map.insert(PathBuf::new(), self.drive_root_id.clone());
 
             for item in &upload_items {
-                let p = item.rel_path.parent().unwrap_or_else(|| Path::new("")).to_path_buf();
+                let p = item
+                    .rel_path
+                    .parent()
+                    .unwrap_or_else(|| Path::new(""))
+                    .to_path_buf();
                 if !parent_map.contains_key(&p) {
-                    match self.drive.ensure_remote_dir_path(&self.drive_root_id, &p).await {
-                        Ok(id) => { parent_map.insert(p, id); }
+                    match self.ensure_remote_dir_cached(&p).await {
+                        Ok(id) => {
+                            parent_map.insert(p, id);
+                        }
                         Err(err) => {
                             error!("Failed to create remote directory for {:?}: {:#}", p, err);
                         }
@@ -371,8 +512,27 @@ impl SyncCoordinator {
 
             for child in children {
                 let sanitized_name = sanitize_filename_component(&child.name);
-                let child_rel_path = relative_dir.join(&sanitized_name);
-                let child_abs_path = self.local_root.join(&child_rel_path);
+                let is_doc = child.is_google_doc();
+                let export_info = child.get_export_mime_and_ext();
+
+                let (export_mime, child_rel_path, child_abs_path) = if let Some((mime, ext)) = export_info {
+                    let filename = if sanitized_name.ends_with(&format!(".{}", ext)) {
+                        sanitized_name.clone()
+                    } else {
+                        format!("{}.{}", sanitized_name, ext)
+                    };
+                    let rel = relative_dir.join(&filename);
+                    let abs = self.local_root.join(&rel);
+                    (Some(mime.to_string()), rel, abs)
+                } else if is_doc {
+                    warn!("Skipping unsupported Google Workspace file: {:?} ({:?})", child.name, child.mime_type);
+                    unchanged += 1;
+                    continue;
+                } else {
+                    let rel = relative_dir.join(&sanitized_name);
+                    let abs = self.local_root.join(&rel);
+                    (None, rel, abs)
+                };
 
                 if filter.is_ignored(&child_abs_path, child.is_folder()) {
                     continue;
@@ -380,7 +540,7 @@ impl SyncCoordinator {
 
                 if child.is_folder() {
                     if !options.dry_run && !child_abs_path.exists() {
-                        if let Err(e) = std::fs::create_dir_all(&child_abs_path) {
+                        if let Err(e) = tokio::fs::create_dir_all(&child_abs_path).await {
                             error!("Failed to create local directory {:?}: {}", child_abs_path, e);
                             failed += 1;
                             continue;
@@ -393,17 +553,22 @@ impl SyncCoordinator {
 
                     let needs_download = if !child_abs_path.exists() {
                         true
+                    } else if export_mime.is_some() {
+                        existing_record.is_none()
                     } else if let Some(rec) = existing_record {
                         rec.md5_checksum != remote_md5
                     } else {
-                        let local_md5 = compute_file_md5(&child_abs_path).unwrap_or_default();
+                        let local_md5 = compute_file_md5_async(child_abs_path.clone())
+                            .await
+                            .unwrap_or_default();
                         local_md5 != remote_md5
                     };
 
                     if needs_download {
                         let size_bytes = child.size_bytes();
                         if options.dry_run {
-                            println!("  [DOWNLOAD] {:?} ({})", child_rel_path, format_size(size_bytes));
+                            let action = if export_mime.is_some() { "EXPORT" } else { "DOWNLOAD" };
+                            println!("  [{}] {:?} ({})", action, child_rel_path, format_size(size_bytes));
                             downloaded += 1;
                         } else {
                             download_items.push(DownloadItem {
@@ -412,6 +577,7 @@ impl SyncCoordinator {
                                 child_abs_path,
                                 remote_md5,
                                 size_bytes,
+                                export_mime,
                             });
                         }
                     } else {
@@ -453,7 +619,11 @@ impl SyncCoordinator {
                         bar.set_message(format!("{}", item.child_rel_path.display()));
                     }
 
-                    let download_res = drive.download_file(&item.child_id, &item.child_abs_path).await;
+                    let download_res = if let Some(ref export_mime) = item.export_mime {
+                        drive.export_file(&item.child_id, export_mime, &item.child_abs_path).await
+                    } else {
+                        drive.download_file(&item.child_id, &item.child_abs_path).await
+                    };
 
                     if let Some(ref bar) = pb_clone {
                         bar.inc(1);
@@ -461,19 +631,28 @@ impl SyncCoordinator {
 
                     match download_res {
                         Ok(()) => {
-                            let mtime = std::fs::metadata(&item.child_abs_path)
+                            let mtime = tokio::fs::metadata(&item.child_abs_path)
+                                .await
                                 .ok()
                                 .and_then(|m| m.modified().ok())
                                 .and_then(|t| t.duration_since(UNIX_EPOCH).ok())
                                 .map(|d| d.as_secs() as i64)
                                 .unwrap_or(0);
 
+                            let final_md5 = if item.remote_md5.is_empty() {
+                                compute_file_md5_async(item.child_abs_path.clone())
+                                    .await
+                                    .unwrap_or_default()
+                            } else {
+                                item.remote_md5
+                            };
+
                             let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_secs() as i64;
                             let _ = db.upsert_file(&TrackedFileRecord {
                                 local_root,
                                 rel_path: item.child_rel_path.clone(),
                                 drive_id: item.child_id,
-                                md5_checksum: item.remote_md5,
+                                md5_checksum: final_md5,
                                 modified_secs: mtime,
                                 size_bytes: item.size_bytes,
                                 is_directory: false,
@@ -524,9 +703,7 @@ impl SyncCoordinator {
                 };
 
                 if abs_path.is_dir() {
-                    self.drive
-                        .ensure_remote_dir_path(&self.drive_root_id, &rel_path)
-                        .await?;
+                    self.ensure_remote_dir_cached(&rel_path).await?;
                     return Ok(());
                 }
 
@@ -534,7 +711,7 @@ impl SyncCoordinator {
                     return Ok(());
                 }
 
-                let local_md5 = compute_file_md5(&abs_path)?;
+                let local_md5 = compute_file_md5_async(abs_path.clone()).await?;
                 let existing_record = self.db.get_file(&self.local_root, &rel_path)?;
 
                 if let Some(ref record) = existing_record {
@@ -544,10 +721,7 @@ impl SyncCoordinator {
                 }
 
                 let parent_dir = rel_path.parent().unwrap_or_else(|| Path::new(""));
-                let target_parent_id = self
-                    .drive
-                    .ensure_remote_dir_path(&self.drive_root_id, parent_dir)
-                    .await?;
+                let target_parent_id = self.ensure_remote_dir_cached(parent_dir).await?;
 
                 let file_name = rel_path.file_name().unwrap().to_string_lossy();
                 let existing_id = existing_record.as_ref().map(|r| r.drive_id.as_str());
@@ -558,7 +732,7 @@ impl SyncCoordinator {
                     .upload_resumable(&target_parent_id, &file_name, &abs_path, existing_id)
                     .await?;
 
-                let metadata = std::fs::metadata(&abs_path)?;
+                let metadata = tokio::fs::metadata(&abs_path).await?;
                 let mtime = metadata
                     .modified()
                     .ok()
@@ -628,3 +802,43 @@ impl SyncCoordinator {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_sync_options_defaults() {
+        let options = SyncOptions::default();
+        assert!(!options.dry_run);
+        assert!(!options.permanent_delete);
+        assert!(!options.force);
+        assert_eq!(options.concurrency, 4);
+        assert!(options.show_progress);
+    }
+
+    #[test]
+    fn test_bulk_deletion_threshold_logic() {
+        let is_exceeded = |delete_count: usize, total_tracked: usize| -> bool {
+            delete_count > 50 || (total_tracked >= 10 && delete_count * 5 > total_tracked)
+        };
+
+        // Below 10 total: even if deleting all, does not exceed unless > 50
+        assert!(!is_exceeded(3, 5));
+        assert!(!is_exceeded(9, 9));
+
+        // 10 or more: 20% rule
+        // 2 out of 10 is 20% (not strictly > 20%)
+        assert!(!is_exceeded(2, 10));
+        // 3 out of 10 is 30% (> 20%)
+        assert!(is_exceeded(3, 10));
+
+        // 100 files: 21 deleted triggers guard
+        assert!(is_exceeded(21, 100));
+        assert!(!is_exceeded(20, 100));
+
+        // Above 50 files: always triggers guard
+        assert!(is_exceeded(51, 1000));
+    }
+}
+

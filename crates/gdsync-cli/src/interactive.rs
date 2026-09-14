@@ -126,7 +126,7 @@ pub async fn run_interactive_mode() -> Result<()> {
                         .default(false)
                         .interact()?;
 
-                    crate::handle_sync(target_dir, dry_run, 4, false).await?;
+                    crate::handle_sync(target_dir, dry_run, 4, false, false).await?;
                 }
             }
             1 => {
@@ -138,7 +138,7 @@ pub async fn run_interactive_mode() -> Result<()> {
                         .interact()?;
 
                     println!("\nStarting real-time watcher daemon. Press Ctrl+C to stop.\n");
-                    crate::handle_watch(target_dir, None, 4, false, notify).await?;
+                    crate::handle_watch(target_dir, None, 4, false, notify, false).await?;
                 }
             }
             2 => {

@@ -192,6 +192,14 @@ pub fn compute_file_md5(path: &Path) -> Result<String> {
     Ok(hex::encode(digest))
 }
 
+/// Asynchronously computes the MD5 checksum of a local file by offloading synchronous I/O
+/// to Tokio's blocking threadpool, preventing worker thread starvation on large files.
+pub async fn compute_file_md5_async(path: PathBuf) -> Result<String> {
+    tokio::task::spawn_blocking(move || compute_file_md5(&path))
+        .await
+        .context("Background MD5 computation task panicked")?
+}
+
 /// Sanitizes a single filename component (file or directory name) from Google Drive
 /// or external sources to be fully valid, safe, and compliant with Linux filesystems (NAME_MAX <= 255 bytes).
 ///

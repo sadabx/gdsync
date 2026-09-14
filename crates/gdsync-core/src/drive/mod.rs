@@ -6,6 +6,7 @@ use std::fs::File;
 use std::io::{Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::Mutex;
 use tracing::{debug, warn};
 
@@ -37,6 +38,31 @@ pub struct DriveFile {
 impl DriveFile {
     pub fn is_folder(&self) -> bool {
         self.mime_type == FOLDER_MIME_TYPE
+    }
+
+    pub fn is_google_doc(&self) -> bool {
+        self.mime_type.starts_with("application/vnd.google-apps.")
+            && !self.is_folder()
+            && self.mime_type != "application/vnd.google-apps.shortcut"
+    }
+
+    pub fn get_export_mime_and_ext(&self) -> Option<(&'static str, &'static str)> {
+        match self.mime_type.as_str() {
+            "application/vnd.google-apps.document" => Some((
+                "application/vnd.openxmlformats-officedocument.wordprocessingml.document",
+                "docx",
+            )),
+            "application/vnd.google-apps.spreadsheet" => Some((
+                "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                "xlsx",
+            )),
+            "application/vnd.google-apps.presentation" => Some((
+                "application/vnd.openxmlformats-officedocument.presentationml.presentation",
+                "pptx",
+            )),
+            "application/vnd.google-apps.drawing" => Some(("image/png", "png")),
+            _ => None,
+        }
     }
 
     pub fn size_bytes(&self) -> u64 {
@@ -463,36 +489,106 @@ impl DriveClient {
 
             let content_range = format!("bytes {}-{}/{}", chunk_start, chunk_end, total_size);
 
-            let chunk_resp = self
-                .client
-                .put(&upload_url)
-                .header(header::CONTENT_LENGTH, to_read.to_string())
-                .header(header::CONTENT_RANGE, &content_range)
-                .body(buffer[..to_read].to_vec())
-                .send()
-                .await
-                .with_context(|| format!("Failed to upload chunk {}", content_range))?;
+            let mut attempts = 0;
+            let max_chunk_attempts = 4;
+            let mut backoff = Duration::from_secs(1);
+            let mut chunk_succeeded = false;
 
-            let status = chunk_resp.status();
+            while attempts < max_chunk_attempts {
+                attempts += 1;
 
-            if status.is_success() {
-                // Upload complete
-                let drive_file: DriveFile = chunk_resp
-                    .json()
-                    .await
-                    .context("Failed to parse uploaded DriveFile response")?;
-                debug!(
-                    "Successfully completed upload for '{}' (ID: {}, MD5: {:?})",
-                    file_name, drive_file.id, drive_file.md5_checksum
+                let send_res = self
+                    .client
+                    .put(&upload_url)
+                    .header(header::CONTENT_LENGTH, to_read.to_string())
+                    .header(header::CONTENT_RANGE, &content_range)
+                    .body(buffer[..to_read].to_vec())
+                    .send()
+                    .await;
+
+                match send_res {
+                    Ok(chunk_resp) => {
+                        let status = chunk_resp.status();
+
+                        if status.is_success() {
+                            // Upload complete
+                            let drive_file: DriveFile = chunk_resp
+                                .json()
+                                .await
+                                .context("Failed to parse uploaded DriveFile response")?;
+                            debug!(
+                                "Successfully completed upload for '{}' (ID: {}, MD5: {:?})",
+                                file_name, drive_file.id, drive_file.md5_checksum
+                            );
+                            return Ok(drive_file);
+                        } else if status == StatusCode::from_u16(308).unwrap() {
+                            // Resume Incomplete - proceed with next chunk
+                            uploaded_bytes = chunk_end + 1;
+                            chunk_succeeded = true;
+                            debug!("Uploaded chunk: {} (status 308)", content_range);
+                            break;
+                        } else if status.is_server_error() || status == StatusCode::TOO_MANY_REQUESTS {
+                            warn!(
+                                "Chunk upload received {} (attempt {}/{}), retrying in {:?}",
+                                status, attempts, max_chunk_attempts, backoff
+                            );
+                            tokio::time::sleep(backoff).await;
+                            backoff *= 2;
+                        } else {
+                            let err = chunk_resp.text().await.unwrap_or_default();
+                            bail!("Resumable upload failed on chunk {}: {}", content_range, err);
+                        }
+                    }
+                    Err(net_err) => {
+                        warn!(
+                            "Network error uploading chunk {} (attempt {}/{}): {}",
+                            content_range, attempts, max_chunk_attempts, net_err
+                        );
+                        tokio::time::sleep(backoff).await;
+                        backoff *= 2;
+                    }
+                }
+
+                // If attempt failed, query upload status from Google Drive using Resume Incomplete
+                if attempts < max_chunk_attempts {
+                    if let Ok(query_resp) = self
+                        .client
+                        .put(&upload_url)
+                        .header(header::CONTENT_LENGTH, "0")
+                        .header(header::CONTENT_RANGE, format!("bytes */{}", total_size))
+                        .send()
+                        .await
+                    {
+                        if query_resp.status().is_success() {
+                            let drive_file: DriveFile = query_resp.json().await?;
+                            return Ok(drive_file);
+                        } else if query_resp.status() == StatusCode::from_u16(308).unwrap() {
+                            if let Some(range_header) = query_resp.headers().get(header::RANGE) {
+                                if let Ok(range_str) = range_header.to_str() {
+                                    if let Some(dash) = range_str.rfind('-') {
+                                        if let Ok(last_byte) = range_str[dash + 1..].trim().parse::<u64>() {
+                                            debug!(
+                                                "Recovered upload progress from server range: bytes=0-{}",
+                                                last_byte
+                                            );
+                                            uploaded_bytes = last_byte + 1;
+                                            chunk_succeeded = true;
+                                            break;
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if !chunk_succeeded && uploaded_bytes < total_size {
+                bail!(
+                    "Failed to upload chunk {} after {} attempts",
+                    content_range,
+                    max_chunk_attempts
                 );
-                return Ok(drive_file);
-            } else if status == StatusCode::from_u16(308).unwrap() {
-                // Resume Incomplete - proceed with next chunk
-                uploaded_bytes = chunk_end + 1;
-                debug!("Uploaded chunk: {} (status 308)", content_range);
-            } else {
-                let err = chunk_resp.text().await.unwrap_or_default();
-                bail!("Resumable upload failed on chunk {}: {}", content_range, err);
             }
         }
 
@@ -516,7 +612,7 @@ impl DriveClient {
         };
 
         if let Some(parent) = sanitized_path.parent() {
-            std::fs::create_dir_all(parent)?;
+            tokio::fs::create_dir_all(parent).await?;
         }
 
         let resp = self
@@ -533,10 +629,48 @@ impl DriveClient {
         }
 
         let bytes = resp.bytes().await.context("Failed to read response body")?;
-        std::fs::write(&sanitized_path, &bytes)
+        tokio::fs::write(&sanitized_path, &bytes)
+            .await
             .with_context(|| format!("Failed to write downloaded file to {:?}", sanitized_path))?;
 
         debug!("Downloaded Drive file {} to {:?}", file_id, sanitized_path);
+        Ok(())
+    }
+
+    /// Exports a Google Workspace document (Doc, Sheet, Slide, etc.) to a standard open format.
+    pub async fn export_file(
+        &self,
+        file_id: &str,
+        export_mime_type: &str,
+        destination_path: &Path,
+    ) -> Result<()> {
+        let auth = self.auth_header().await?;
+        let url = format!("{}/{}/export", DRIVE_FILES_API, file_id);
+
+        if let Some(parent) = destination_path.parent() {
+            tokio::fs::create_dir_all(parent).await?;
+        }
+
+        let resp = self
+            .client
+            .get(&url)
+            .query(&[("mimeType", export_mime_type)])
+            .header(header::AUTHORIZATION, &auth)
+            .send()
+            .await
+            .context("Failed to export Google Workspace document from Drive")?;
+
+        if !resp.status().is_success() {
+            let err = resp.text().await.unwrap_or_default();
+            bail!("Drive export_file failed for {}: {}", file_id, err);
+        }
+
+        let bytes = resp.bytes().await.context("Failed to read export response body")?;
+        tokio::fs::write(destination_path, &bytes)
+            .await
+            .with_context(|| format!("Failed to write exported file to {:?}", destination_path))?;
+
+        debug!("Exported Google Workspace file {} to {:?}", file_id, destination_path);
         Ok(())
     }
 
@@ -590,3 +724,55 @@ impl DriveClient {
         Ok(())
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn test_google_docs_mime_detection() {
+        let doc = DriveFile {
+            id: "doc1".to_string(),
+            name: "Quarterly Report".to_string(),
+            mime_type: "application/vnd.google-apps.document".to_string(),
+            md5_checksum: None,
+            modified_time: None,
+            size: None,
+            trashed: None,
+            parents: None,
+        };
+        assert!(doc.is_google_doc());
+        assert!(!doc.is_folder());
+        let (mime, ext) = doc.get_export_mime_and_ext().unwrap();
+        assert_eq!(ext, "docx");
+        assert_eq!(mime, "application/vnd.openxmlformats-officedocument.wordprocessingml.document");
+
+        let sheet = DriveFile {
+            id: "sheet1".to_string(),
+            name: "Budget 2026".to_string(),
+            mime_type: "application/vnd.google-apps.spreadsheet".to_string(),
+            md5_checksum: None,
+            modified_time: None,
+            size: None,
+            trashed: None,
+            parents: None,
+        };
+        assert!(sheet.is_google_doc());
+        let (_, ext) = sheet.get_export_mime_and_ext().unwrap();
+        assert_eq!(ext, "xlsx");
+
+        let normal_file = DriveFile {
+            id: "file1".to_string(),
+            name: "archive.tar.gz".to_string(),
+            mime_type: "application/gzip".to_string(),
+            md5_checksum: Some("abc123".to_string()),
+            modified_time: None,
+            size: Some("1024".to_string()),
+            trashed: None,
+            parents: None,
+        };
+        assert!(!normal_file.is_google_doc());
+        assert!(normal_file.get_export_mime_and_ext().is_none());
+    }
+}
+
