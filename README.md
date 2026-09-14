@@ -60,6 +60,28 @@ gdsync auth
 
 *Opens your browser to complete Google OAuth2 PKCE login. Tokens are cached locally in `~/.config/gdsync/token.json`.*
 
+<details>
+<summary><b>(Optional) Using your own Google Cloud credentials for dedicated quota</b></summary>
+<br/>
+
+`gdsync` works out of the box with zero setup using pre-registered public desktop credentials. If you perform massive initial syncs or want private, unthrottled API quota (12,000 requests/min):
+
+1. Open [Google Cloud Console](https://console.cloud.google.com/) and click **New Project** (name it `gdsync`).
+2. Go to **APIs & Services > Library**, search for **Google Drive API**, and click **Enable**.
+3. Go to **APIs & Services > OAuth consent screen**:
+   - Select **External**, enter an App name (`gdsync`) and your email.
+   - Under **Test users**, add your Google email address.
+4. Go to **APIs & Services > Credentials**:
+   - Click **Create Credentials > OAuth client ID**.
+   - Choose Application type: **Desktop app**.
+   - Copy your **Client ID** and **Client Secret**.
+5. Run authentication with your keys:
+   ```bash
+   gdsync auth --client-id "YOUR_CLIENT_ID" --client-secret "YOUR_CLIENT_SECRET"
+   ```
+Your credentials will be stored in `~/.config/gdsync/config.toml` so you never need to re-enter them.
+</details>
+
 ### 4. Link & Watch a Folder
 
 ```bash
